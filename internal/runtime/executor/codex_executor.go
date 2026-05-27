@@ -37,6 +37,98 @@ const (
 
 var dataTag = []byte("data:")
 
+type codexHTTPResult struct {
+	resp *http.Response
+	err  error
+}
+
+func codexStreamBootstrapTimeout(cfg *config.Config) time.Duration {
+	if cfg == nil || cfg.Streaming.BootstrapTimeoutSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(cfg.Streaming.BootstrapTimeoutSeconds) * time.Second
+}
+
+func newCodexStreamBootstrapTimeoutErr(phase string, timeout time.Duration) statusErr {
+	return statusErr{
+		code: http.StatusGatewayTimeout,
+		msg:  fmt.Sprintf("codex stream bootstrap timeout waiting for %s after %s", phase, timeout),
+	}
+}
+
+func copyHTTPHeaderInto(dst http.Header, src http.Header) {
+	for k := range dst {
+		delete(dst, k)
+	}
+	for k, values := range src {
+		dst[k] = append([]string(nil), values...)
+	}
+}
+
+func sendCodexStreamChunk(ctx context.Context, out chan<- cliproxyexecutor.StreamChunk, chunk cliproxyexecutor.StreamChunk) bool {
+	if ctx == nil {
+		out <- chunk
+		return true
+	}
+	select {
+	case out <- chunk:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func closeLateCodexHTTPResponse(resultCh <-chan codexHTTPResult) {
+	go func() {
+		result := <-resultCh
+		if result.resp == nil || result.resp.Body == nil {
+			return
+		}
+		if errClose := result.resp.Body.Close(); errClose != nil {
+			log.Errorf("codex executor: close late response body error: %v", errClose)
+		}
+	}()
+}
+
+func doCodexStreamRequestWithBootstrapDeadline(ctx context.Context, client *http.Client, req *http.Request, deadline time.Time, timeout time.Duration) (*http.Response, func(), error) {
+	if deadline.IsZero() {
+		resp, err := client.Do(req)
+		return resp, func() {}, err
+	}
+
+	wait := time.Until(deadline)
+	if wait <= 0 {
+		return nil, func() {}, newCodexStreamBootstrapTimeoutErr("upstream response headers", timeout)
+	}
+
+	doCtx, cancelDo := context.WithCancel(ctx)
+	resultCh := make(chan codexHTTPResult, 1)
+	go func() {
+		resp, errDo := client.Do(req.WithContext(doCtx))
+		resultCh <- codexHTTPResult{resp: resp, err: errDo}
+	}()
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			cancelDo()
+			return nil, func() {}, result.err
+		}
+		return result.resp, cancelDo, nil
+	case <-timer.C:
+		cancelDo()
+		closeLateCodexHTTPResponse(resultCh)
+		return nil, func() {}, newCodexStreamBootstrapTimeoutErr("upstream response headers", timeout)
+	case <-ctx.Done():
+		cancelDo()
+		closeLateCodexHTTPResponse(resultCh)
+		return nil, func() {}, ctx.Err()
+	}
+}
+
 // Streamed Codex responses may emit response.output_item.done events while leaving
 // response.completed.response.output empty. Keep the stream path aligned with the
 // already-patched non-stream path by reconstructing response.output from those items.
@@ -499,6 +591,9 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 }
 
 func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
 	}
@@ -567,88 +662,148 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthValue: authValue,
 	})
 
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := httpClient.Do(httpReq)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return nil, err
-	}
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		data, readErr := io.ReadAll(httpResp.Body)
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("codex executor: close response body error: %v", errClose)
-		}
-		if readErr != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
-			return nil, readErr
-		}
-		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		err = newCodexStatusErr(httpResp.StatusCode, data)
-		return nil, err
-	}
+	upstreamHeaders := make(http.Header)
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
+		timeout := codexStreamBootstrapTimeout(e.cfg)
+		deadline := time.Time{}
+		if timeout > 0 {
+			deadline = time.Now().Add(timeout)
+		}
+
+		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+		httpResp, cancelReq, errDo := doCodexStreamRequestWithBootstrapDeadline(ctx, httpClient, httpReq, deadline, timeout)
+		if errDo != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+			reporter.PublishFailure(ctx, errDo)
+			_ = sendCodexStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: errDo})
+			return
+		}
+		defer cancelReq()
+		copyHTTPHeaderInto(upstreamHeaders, httpResp.Header)
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			data, readErr := io.ReadAll(httpResp.Body)
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("codex executor: close response body error: %v", errClose)
+			}
+			if readErr != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+				reporter.PublishFailure(ctx, readErr)
+				_ = sendCodexStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: readErr})
+				return
+			}
+			helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+			helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+			statusErr := newCodexStatusErr(httpResp.StatusCode, data)
+			reporter.PublishFailure(ctx, statusErr)
+			_ = sendCodexStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: statusErr})
+			return
+		}
 		defer func() {
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("codex executor: close response body error: %v", errClose)
 			}
 		}()
-		scanner := bufio.NewScanner(httpResp.Body)
-		scanner.Buffer(nil, 52_428_800) // 50MB
-		var param any
-		outputItemsByIndex := make(map[int64][]byte)
-		var outputItemsFallback [][]byte
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			translatedLine := bytes.Clone(line)
 
-			if bytes.HasPrefix(line, dataTag) {
-				data := bytes.TrimSpace(line[5:])
-				if streamErr, ok := codexTerminalStreamContextLengthErr(data); ok {
-					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-					reporter.PublishFailure(ctx, streamErr)
-					select {
-					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
-					case <-ctx.Done():
+		scanCtx, cancelScan := context.WithCancel(ctx)
+		defer cancelScan()
+		scanCh := make(chan cliproxyexecutor.StreamChunk)
+		go func() {
+			defer close(scanCh)
+			scanner := bufio.NewScanner(httpResp.Body)
+			scanner.Buffer(nil, 52_428_800) // 50MB
+			var param any
+			outputItemsByIndex := make(map[int64][]byte)
+			var outputItemsFallback [][]byte
+			for scanner.Scan() {
+				line := scanner.Bytes()
+				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+				translatedLine := bytes.Clone(line)
+
+				if bytes.HasPrefix(line, dataTag) {
+					data := bytes.TrimSpace(line[5:])
+					if streamErr, ok := codexTerminalStreamContextLengthErr(data); ok {
+						helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+						reporter.PublishFailure(ctx, streamErr)
+						_ = sendCodexStreamChunk(scanCtx, scanCh, cliproxyexecutor.StreamChunk{Err: streamErr})
+						return
 					}
-					return
+					switch gjson.GetBytes(data, "type").String() {
+					case "response.output_item.done":
+						collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
+					case "response.completed":
+						if detail, ok := helps.ParseCodexUsage(data); ok {
+							reporter.Publish(ctx, detail)
+						}
+						publishCodexImageToolUsage(ctx, reporter, body, data)
+						data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
+						translatedLine = append([]byte("data: "), data...)
+					}
 				}
-				switch gjson.GetBytes(data, "type").String() {
-				case "response.output_item.done":
-					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
-				case "response.completed":
-					if detail, ok := helps.ParseCodexUsage(data); ok {
-						reporter.Publish(ctx, detail)
+
+				chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, translatedLine, &param)
+				for i := range chunks {
+					if !sendCodexStreamChunk(scanCtx, scanCh, cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
+						return
 					}
-					publishCodexImageToolUsage(ctx, reporter, body, data)
-					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
-					translatedLine = append([]byte("data: "), data...)
 				}
 			}
-
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, translatedLine, &param)
-			for i := range chunks {
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
-				case <-ctx.Done():
-					return
-				}
+			if errScan := scanner.Err(); errScan != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+				reporter.PublishFailure(ctx, errScan)
+				_ = sendCodexStreamChunk(scanCtx, scanCh, cliproxyexecutor.StreamChunk{Err: errScan})
 			}
+		}()
+
+		var firstPayloadTimer *time.Timer
+		var firstPayloadTimeout <-chan time.Time
+		if !deadline.IsZero() {
+			wait := time.Until(deadline)
+			if wait < 0 {
+				wait = 0
+			}
+			firstPayloadTimer = time.NewTimer(wait)
+			firstPayloadTimeout = firstPayloadTimer.C
+			defer firstPayloadTimer.Stop()
 		}
-		if errScan := scanner.Err(); errScan != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
+		for {
 			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+			case chunk, ok := <-scanCh:
+				if !ok {
+					return
+				}
+				if len(chunk.Payload) > 0 && firstPayloadTimer != nil {
+					if !firstPayloadTimer.Stop() {
+						select {
+						case <-firstPayloadTimer.C:
+						default:
+						}
+					}
+					firstPayloadTimer = nil
+					firstPayloadTimeout = nil
+				}
+				if !sendCodexStreamChunk(ctx, out, chunk) {
+					return
+				}
+				if chunk.Err != nil {
+					return
+				}
+			case <-firstPayloadTimeout:
+				timeoutErr := newCodexStreamBootstrapTimeoutErr("first upstream payload", timeout)
+				helps.RecordAPIResponseError(ctx, e.cfg, timeoutErr)
+				reporter.PublishFailure(ctx, timeoutErr)
+				cancelScan()
+				_ = sendCodexStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: timeoutErr})
+				return
 			case <-ctx.Done():
+				cancelScan()
+				return
 			}
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{Headers: upstreamHeaders, Chunks: out}, nil
 }
 
 func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {

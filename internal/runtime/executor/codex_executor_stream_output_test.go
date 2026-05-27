@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
@@ -15,6 +16,157 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+func TestCodexExecutorExecuteStreamBootstrapTimeoutBeforeHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{
+			Streaming: config.StreamingConfig{BootstrapTimeoutSeconds: 1},
+		},
+	})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: []byte(`{"model":"gpt-5.5","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	streamErr := readCodexStreamErr(t, result, 3*time.Second)
+	if streamErr == nil {
+		t.Fatal("expected bootstrap timeout error")
+	}
+	if got := statusCodeFromTestError(t, streamErr); got != http.StatusGatewayTimeout {
+		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusGatewayTimeout, streamErr)
+	}
+	if !strings.Contains(streamErr.Error(), "upstream response headers") {
+		t.Fatalf("error should identify header phase: %v", streamErr)
+	}
+}
+
+func TestCodexExecutorExecuteStreamBootstrapTimeoutBeforeFirstPayload(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		time.Sleep(2 * time.Second)
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{
+			Streaming: config.StreamingConfig{BootstrapTimeoutSeconds: 1},
+		},
+	})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: []byte(`{"model":"gpt-5.5","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	streamErr := readCodexStreamErr(t, result, 3*time.Second)
+	if streamErr == nil {
+		t.Fatal("expected bootstrap timeout error")
+	}
+	if got := statusCodeFromTestError(t, streamErr); got != http.StatusGatewayTimeout {
+		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusGatewayTimeout, streamErr)
+	}
+	if !strings.Contains(streamErr.Error(), "first upstream payload") {
+		t.Fatalf("error should identify first-payload phase: %v", streamErr)
+	}
+}
+
+func TestCodexExecutorExecuteStreamBootstrapTimeoutStopsAfterFirstPayload(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1775555723,\"status\":\"completed\",\"model\":\"gpt-5.5\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		time.Sleep(1200 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{
+			Streaming: config.StreamingConfig{BootstrapTimeoutSeconds: 1},
+		},
+	})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: []byte(`{"model":"gpt-5.5","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	gotPayload := false
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error after first payload: %v", chunk.Err)
+		}
+		if len(chunk.Payload) > 0 {
+			gotPayload = true
+		}
+	}
+	if !gotPayload {
+		t.Fatal("expected at least one stream payload")
+	}
+}
+
+func readCodexStreamErr(t *testing.T, result *cliproxyexecutor.StreamResult, timeout time.Duration) error {
+	t.Helper()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case chunk, ok := <-result.Chunks:
+			if !ok {
+				return nil
+			}
+			if chunk.Err != nil {
+				return chunk.Err
+			}
+		case <-timer.C:
+			t.Fatalf("timed out waiting for stream error after %s", timeout)
+		}
+	}
+}
 
 func TestCodexExecutorExecute_EmptyStreamCompletionOutputUsesOutputItemDone(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
