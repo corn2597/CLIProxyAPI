@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -36,10 +37,10 @@ func (e *failOnceStreamExecutor) ExecuteStream(context.Context, *coreauth.Auth, 
 	if call == 1 {
 		ch <- coreexecutor.StreamChunk{
 			Err: &coreauth.Error{
-				Code:       "unauthorized",
-				Message:    "unauthorized",
+				Code:       "bootstrap_timeout",
+				Message:    "bootstrap timeout",
 				Retryable:  false,
-				HTTPStatus: http.StatusUnauthorized,
+				HTTPStatus: http.StatusGatewayTimeout,
 			},
 		}
 		close(ch)
@@ -74,6 +75,57 @@ func (e *failOnceStreamExecutor) HttpRequest(ctx context.Context, auth *coreauth
 }
 
 func (e *failOnceStreamExecutor) Calls() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls
+}
+
+type alwaysFailBootstrapStreamExecutor struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (e *alwaysFailBootstrapStreamExecutor) Identifier() string { return "codex" }
+
+func (e *alwaysFailBootstrapStreamExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "Execute not implemented"}
+}
+
+func (e *alwaysFailBootstrapStreamExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	e.mu.Lock()
+	e.calls++
+	e.mu.Unlock()
+
+	ch := make(chan coreexecutor.StreamChunk, 1)
+	ch <- coreexecutor.StreamChunk{
+		Err: &coreauth.Error{
+			Code:       "bootstrap_timeout",
+			Message:    "bootstrap timeout",
+			Retryable:  false,
+			HTTPStatus: http.StatusGatewayTimeout,
+		},
+	}
+	close(ch)
+	return &coreexecutor.StreamResult{Chunks: ch}, nil
+}
+
+func (e *alwaysFailBootstrapStreamExecutor) Refresh(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *alwaysFailBootstrapStreamExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "CountTokens not implemented"}
+}
+
+func (e *alwaysFailBootstrapStreamExecutor) HttpRequest(ctx context.Context, auth *coreauth.Auth, req *http.Request) (*http.Response, error) {
+	return nil, &coreauth.Error{
+		Code:       "not_implemented",
+		Message:    "HttpRequest not implemented",
+		HTTPStatus: http.StatusNotImplemented,
+	}
+}
+
+func (e *alwaysFailBootstrapStreamExecutor) Calls() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.calls
@@ -273,6 +325,13 @@ func (e *authAwareStreamExecutor) AuthIDs() []string {
 func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 	executor := &failOnceStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			Streaming: internalconfig.StreamingConfig{
+				BootstrapRetries: 1,
+			},
+		},
+	})
 	manager.RegisterExecutor(executor)
 
 	auth1 := &coreauth.Auth{
@@ -304,9 +363,6 @@ func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 
 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
 		PassthroughHeaders: true,
-		Streaming: sdkconfig.StreamingConfig{
-			BootstrapRetries: 1,
-		},
 	}, manager)
 	dataChan, upstreamHeaders, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "test-model", []byte(`{"model":"test-model"}`), "")
 	if dataChan == nil || errChan == nil {
@@ -339,6 +395,13 @@ func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 func TestExecuteStreamWithAuthManager_HeaderPassthroughDisabledByDefault(t *testing.T) {
 	executor := &failOnceStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			Streaming: internalconfig.StreamingConfig{
+				BootstrapRetries: 1,
+			},
+		},
+	})
 	manager.RegisterExecutor(executor)
 
 	auth1 := &coreauth.Auth{
@@ -368,11 +431,7 @@ func TestExecuteStreamWithAuthManager_HeaderPassthroughDisabledByDefault(t *test
 		registry.GetGlobalRegistry().UnregisterClient(auth2.ID)
 	})
 
-	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
-		Streaming: sdkconfig.StreamingConfig{
-			BootstrapRetries: 1,
-		},
-	}, manager)
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
 	dataChan, upstreamHeaders, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "test-model", []byte(`{"model":"test-model"}`), "")
 	if dataChan == nil || errChan == nil {
 		t.Fatalf("expected non-nil channels")
@@ -466,9 +525,16 @@ func TestExecuteStreamWithAuthManager_DoesNotRetryAfterFirstByte(t *testing.T) {
 	}
 }
 
-func TestExecuteStreamWithAuthManager_EnrichesBootstrapRetryAuthUnavailableError(t *testing.T) {
-	executor := &failOnceStreamExecutor{}
+func TestExecuteStreamWithAuthManager_ExhaustsSameAuthBootstrapRetriesBeforeFailing(t *testing.T) {
+	executor := &alwaysFailBootstrapStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			Streaming: internalconfig.StreamingConfig{
+				BootstrapRetries: 1,
+			},
+		},
+	})
 	manager.RegisterExecutor(executor)
 
 	auth1 := &coreauth.Auth{
@@ -486,11 +552,7 @@ func TestExecuteStreamWithAuthManager_EnrichesBootstrapRetryAuthUnavailableError
 		registry.GetGlobalRegistry().UnregisterClient(auth1.ID)
 	})
 
-	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
-		Streaming: sdkconfig.StreamingConfig{
-			BootstrapRetries: 1,
-		},
-	}, manager)
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
 	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "test-model", []byte(`{"model":"test-model"}`), "")
 	if dataChan == nil || errChan == nil {
 		t.Fatalf("expected non-nil channels")
@@ -513,26 +575,66 @@ func TestExecuteStreamWithAuthManager_EnrichesBootstrapRetryAuthUnavailableError
 	if gotErr == nil {
 		t.Fatalf("expected terminal error")
 	}
-	if gotErr.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want %d", gotErr.StatusCode, http.StatusServiceUnavailable)
+	if gotErr.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want %d", gotErr.StatusCode, http.StatusGatewayTimeout)
 	}
 
 	var authErr *coreauth.Error
 	if !errors.As(gotErr.Error, &authErr) || authErr == nil {
 		t.Fatalf("expected coreauth.Error, got %T", gotErr.Error)
 	}
-	if authErr.Code != "auth_unavailable" {
-		t.Fatalf("code = %q, want %q", authErr.Code, "auth_unavailable")
-	}
-	if !strings.Contains(authErr.Message, "providers=codex") {
-		t.Fatalf("message missing provider context: %q", authErr.Message)
-	}
-	if !strings.Contains(authErr.Message, "model=test-model") {
-		t.Fatalf("message missing model context: %q", authErr.Message)
+	if authErr.Code != "bootstrap_timeout" {
+		t.Fatalf("code = %q, want %q", authErr.Code, "bootstrap_timeout")
 	}
 
-	if executor.Calls() != 1 {
-		t.Fatalf("expected exactly one upstream call before retry path selection failure, got %d", executor.Calls())
+	if executor.Calls() != 2 {
+		t.Fatalf("expected original call plus one bootstrap retry, got %d", executor.Calls())
+	}
+}
+
+func TestExecuteStreamWithAuthManager_BootstrapRetryCooldown(t *testing.T) {
+	executor := &failOnceStreamExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			Streaming: internalconfig.StreamingConfig{
+				BootstrapRetries:              1,
+				BootstrapRetryCooldownSeconds: 1,
+			},
+		},
+	})
+	manager.RegisterExecutor(executor)
+
+	auth1 := &coreauth.Auth{
+		ID:       "auth1",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"email": "test1@example.com"},
+	}
+	if _, err := manager.Register(context.Background(), auth1); err != nil {
+		t.Fatalf("manager.Register(auth1): %v", err)
+	}
+
+	registry.GetGlobalRegistry().RegisterClient(auth1.ID, auth1.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth1.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	start := time.Now()
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "test-model", []byte(`{"model":"test-model"}`), "")
+	if dataChan == nil || errChan == nil {
+		t.Fatalf("expected non-nil channels")
+	}
+	for range dataChan {
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected error: %+v", msg)
+		}
+	}
+	if elapsed := time.Since(start); elapsed < time.Second {
+		t.Fatalf("expected bootstrap retry cooldown to delay at least 1s, got %s", elapsed)
 	}
 }
 

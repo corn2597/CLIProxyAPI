@@ -86,7 +86,7 @@ passthrough-headers: false
 request-retry: 3
 
 # Maximum number of different credentials to try for one failed request.
-# Set to 0 to keep legacy behavior (try all available credentials).
+# Set to 0 for no extra cap; request-retry still bounds credential switching.
 max-retry-credentials: 0
 
 # Maximum wait time in seconds for a cooled-down credential before triggering a retry.
@@ -138,7 +138,8 @@ nonstream-keepalive-interval: 0
 # Streaming behavior (SSE keep-alives + safe bootstrap retries).
 # streaming:
 #   keepalive-seconds: 15   # Default: 0 (disabled). <= 0 disables keep-alives.
-#   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
+#   bootstrap-retries: 1    # Default: 0 (disabled). Same-auth retries before first byte is sent.
+#   bootstrap-retry-cooldown-seconds: 1 # Default: 0. Wait between same-auth bootstrap retries.
 #   bootstrap-timeout-seconds: 60 # Default: 0 (disabled). Fails/retries streams stuck before first payload.
 
 # Signature cache validation for thinking blocks (Antigravity/Claude).

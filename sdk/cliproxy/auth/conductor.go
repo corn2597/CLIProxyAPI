@@ -815,6 +815,68 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
+func resultErrorFromExecutionError(err error) *Error {
+	if err == nil {
+		return nil
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil {
+		return cloneError(authErr)
+	}
+	rerr := &Error{Message: err.Error()}
+	if se, ok := errors.AsType[cliproxyexecutor.StatusError](err); ok && se != nil {
+		rerr.HTTPStatus = se.StatusCode()
+	}
+	return rerr
+}
+
+func bootstrapRetryableError(err error) bool {
+	if err == nil || isRequestInvalidError(err) {
+		return false
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil {
+		switch strings.TrimSpace(authErr.Code) {
+		case "empty_stream":
+			return true
+		case "auth_not_found", "auth_unavailable", "unauthorized":
+			return false
+		}
+	}
+	switch statusCodeFromError(err) {
+	case http.StatusRequestTimeout, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	case 0:
+	default:
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return errors.Is(err, io.EOF) ||
+		strings.Contains(msg, "eof") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "response body closed") ||
+		strings.Contains(msg, "stream closed before first payload")
+}
+
+func (m *Manager) streamBootstrapRetrySettings() (int, time.Duration) {
+	if m == nil {
+		return 0, 0
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return 0, 0
+	}
+	retries := cfg.Streaming.BootstrapRetries
+	if retries < 0 {
+		retries = 0
+	}
+	cooldownSeconds := cfg.Streaming.BootstrapRetryCooldownSeconds
+	if cooldownSeconds < 0 {
+		cooldownSeconds = 0
+	}
+	return retries, time.Duration(cooldownSeconds) * time.Second
+}
+
 func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
@@ -869,88 +931,86 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	ctx = contextWithRequestedModelAlias(ctx, opts, routeModel)
+	maxBootstrapRetries, bootstrapRetryCooldown := m.streamBootstrapRetrySettings()
 	var lastErr error
 	for idx, execModel := range execModels {
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
 		execReq := req
 		execReq.Model = execModel
-		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
-		if errStream != nil {
-			if errCtx := ctx.Err(); errCtx != nil {
-				return nil, errCtx
-			}
-			rerr := &Error{Message: errStream.Error()}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
-				rerr.HTTPStatus = se.StatusCode()
-			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
-			result.RetryAfter = retryAfterFromError(errStream)
-			m.MarkResult(ctx, result)
-			if isRequestInvalidError(errStream) {
-				return nil, errStream
-			}
-			lastErr = errStream
-			continue
-		}
-
-		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
-		if bootstrapErr != nil {
-			if errCtx := ctx.Err(); errCtx != nil {
-				discardStreamChunks(streamResult.Chunks)
-				return nil, errCtx
-			}
-			if isRequestInvalidError(bootstrapErr) {
-				rerr := &Error{Message: bootstrapErr.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
+		for bootstrapAttempt := 0; ; bootstrapAttempt++ {
+			streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
+			if errStream != nil {
+				if errCtx := ctx.Err(); errCtx != nil {
+					return nil, errCtx
 				}
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+				if bootstrapAttempt < maxBootstrapRetries && bootstrapRetryableError(errStream) {
+					if errWait := waitForCooldown(ctx, bootstrapRetryCooldown); errWait != nil {
+						return nil, errWait
+					}
+					continue
+				}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: resultErrorFromExecutionError(errStream)}
+				result.RetryAfter = retryAfterFromError(errStream)
+				m.MarkResult(ctx, result)
+				if isRequestInvalidError(errStream) {
+					return nil, errStream
+				}
+				lastErr = errStream
+				break
+			}
+
+			buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
+			if bootstrapErr != nil {
+				if errCtx := ctx.Err(); errCtx != nil {
+					discardStreamChunks(streamResult.Chunks)
+					return nil, errCtx
+				}
+				if bootstrapAttempt < maxBootstrapRetries && bootstrapRetryableError(bootstrapErr) {
+					discardStreamChunks(streamResult.Chunks)
+					if errWait := waitForCooldown(ctx, bootstrapRetryCooldown); errWait != nil {
+						return nil, errWait
+					}
+					continue
+				}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: resultErrorFromExecutionError(bootstrapErr)}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
-				return nil, bootstrapErr
-			}
-			if idx < len(execModels)-1 {
-				rerr := &Error{Message: bootstrapErr.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
+				if isRequestInvalidError(bootstrapErr) {
+					return nil, bootstrapErr
 				}
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
-				result.RetryAfter = retryAfterFromError(bootstrapErr)
+				if idx < len(execModels)-1 {
+					lastErr = bootstrapErr
+					break
+				}
+				return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
+			}
+
+			if closed && len(buffered) == 0 {
+				emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
+				if bootstrapAttempt < maxBootstrapRetries && bootstrapRetryableError(emptyErr) {
+					if errWait := waitForCooldown(ctx, bootstrapRetryCooldown); errWait != nil {
+						return nil, errWait
+					}
+					continue
+				}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
 				m.MarkResult(ctx, result)
-				discardStreamChunks(streamResult.Chunks)
-				lastErr = bootstrapErr
-				continue
+				if idx < len(execModels)-1 {
+					lastErr = emptyErr
+					break
+				}
+				return nil, newStreamBootstrapError(emptyErr, streamResult.Headers)
 			}
-			rerr := &Error{Message: bootstrapErr.Error()}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-				rerr.HTTPStatus = se.StatusCode()
-			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
-			result.RetryAfter = retryAfterFromError(bootstrapErr)
-			m.MarkResult(ctx, result)
-			discardStreamChunks(streamResult.Chunks)
-			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
-		}
 
-		if closed && len(buffered) == 0 {
-			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
-			m.MarkResult(ctx, result)
-			if idx < len(execModels)-1 {
-				lastErr = emptyErr
-				continue
+			remaining := streamResult.Chunks
+			if closed {
+				closedCh := make(chan cliproxyexecutor.StreamChunk)
+				close(closedCh)
+				remaining = closedCh
 			}
-			return nil, newStreamBootstrapError(emptyErr, streamResult.Headers)
+			return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining), nil
 		}
-
-		remaining := streamResult.Chunks
-		if closed {
-			closedCh := make(chan cliproxyexecutor.StreamChunk)
-			close(closedCh)
-			remaining = closedCh
-		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -1229,11 +1289,12 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 
-	_, maxRetryCredentials, maxWait := m.retrySettings()
+	requestRetry, maxRetryCredentials, maxWait := m.retrySettings()
+	credentialLimit := credentialAttemptLimit(requestRetry, maxRetryCredentials)
 
 	var lastErr error
 	for attempt := 0; ; attempt++ {
-		resp, errExec := m.executeMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
+		resp, errExec := m.executeMixedOnce(ctx, normalized, req, opts, credentialLimit)
 		if errExec == nil {
 			return resp, nil
 		}
@@ -1264,11 +1325,12 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 
-	_, maxRetryCredentials, maxWait := m.retrySettings()
+	requestRetry, maxRetryCredentials, maxWait := m.retrySettings()
+	credentialLimit := credentialAttemptLimit(requestRetry, maxRetryCredentials)
 
 	var lastErr error
 	for attempt := 0; ; attempt++ {
-		resp, errExec := m.executeCountMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
+		resp, errExec := m.executeCountMixedOnce(ctx, normalized, req, opts, credentialLimit)
 		if errExec == nil {
 			return resp, nil
 		}
@@ -1295,11 +1357,12 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 
-	_, maxRetryCredentials, maxWait := m.retrySettings()
+	requestRetry, maxRetryCredentials, maxWait := m.retrySettings()
+	credentialLimit := credentialAttemptLimit(requestRetry, maxRetryCredentials)
 
 	var lastErr error
 	for attempt := 0; ; attempt++ {
-		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
+		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, credentialLimit)
 		if errStream == nil {
 			return result, nil
 		}
@@ -1327,7 +1390,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
 
-func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int) (cliproxyexecutor.Response, error) {
+func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, credentialLimit int) (cliproxyexecutor.Response, error) {
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -1339,7 +1402,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	attempted := make(map[string]struct{})
 	var lastErr error
 	for {
-		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if !homeMode && credentialLimit > 0 && len(attempted) >= credentialLimit && !bypassCredentialAttemptLimit(lastErr) {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
@@ -1426,7 +1489,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	}
 }
 
-func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int) (cliproxyexecutor.Response, error) {
+func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, credentialLimit int) (cliproxyexecutor.Response, error) {
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -1438,7 +1501,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	attempted := make(map[string]struct{})
 	var lastErr error
 	for {
-		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if !homeMode && credentialLimit > 0 && len(attempted) >= credentialLimit && !bypassCredentialAttemptLimit(lastErr) {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
@@ -1525,7 +1588,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 }
 
-func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, credentialLimit int) (*cliproxyexecutor.StreamResult, error) {
 	if len(providers) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -1537,7 +1600,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	attempted := make(map[string]struct{})
 	var lastErr error
 	for {
-		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if !homeMode && credentialLimit > 0 && len(attempted) >= credentialLimit && !bypassCredentialAttemptLimit(lastErr) {
 			if lastErr != nil {
 				return nil, lastErr
 			}
@@ -2099,6 +2162,21 @@ func (m *Manager) retrySettings() (int, int, time.Duration) {
 		return 0, 0, 0
 	}
 	return int(m.requestRetry.Load()), int(m.maxRetryCredentials.Load()), time.Duration(m.maxRetryInterval.Load())
+}
+
+func credentialAttemptLimit(requestRetry, maxRetryCredentials int) int {
+	if requestRetry < 0 {
+		requestRetry = 0
+	}
+	limit := requestRetry + 1
+	if maxRetryCredentials > 0 && maxRetryCredentials < limit {
+		return maxRetryCredentials
+	}
+	return limit
+}
+
+func bypassCredentialAttemptLimit(err error) bool {
+	return isModelSupportError(err)
 }
 
 func (m *Manager) closestCooldownWait(providers []string, model string, attempt int) (time.Duration, bool) {

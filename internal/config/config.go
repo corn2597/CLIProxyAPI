@@ -83,8 +83,8 @@ type Config struct {
 
 	// RequestRetry defines the retry times when the request failed.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
-	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
-	// Set to 0 or a negative value to keep trying all available credentials (legacy behavior).
+	// MaxRetryCredentials caps how many different credentials may be tried for one failed request.
+	// Set to 0 for no extra cap; request-retry still bounds credential switching.
 	MaxRetryCredentials int `yaml:"max-retry-credentials" json:"max-retry-credentials"`
 	// MaxRetryInterval defines the maximum wait time in seconds before retrying a cooled-down credential.
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`

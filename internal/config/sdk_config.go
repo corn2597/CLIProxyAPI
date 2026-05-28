@@ -59,10 +59,14 @@ type StreamingConfig struct {
 	// <= 0 disables keep-alives. Default is 0.
 	KeepAliveSeconds int `yaml:"keepalive-seconds,omitempty" json:"keepalive-seconds,omitempty"`
 
-	// BootstrapRetries controls how many times the server may retry a streaming request before any bytes are sent,
-	// to allow auth rotation / transient recovery.
+	// BootstrapRetries controls how many times the same auth may retry a streaming request before any bytes are sent,
+	// to recover transient stream startup failures before marking that auth/model failed.
 	// <= 0 disables bootstrap retries. Default is 0.
 	BootstrapRetries int `yaml:"bootstrap-retries,omitempty" json:"bootstrap-retries,omitempty"`
+
+	// BootstrapRetryCooldownSeconds waits between same-auth bootstrap retries.
+	// <= 0 retries immediately. Default is 0.
+	BootstrapRetryCooldownSeconds int `yaml:"bootstrap-retry-cooldown-seconds,omitempty" json:"bootstrap-retry-cooldown-seconds,omitempty"`
 
 	// BootstrapTimeoutSeconds limits how long a streaming request may wait for upstream response headers
 	// or the first translated payload before any bytes are sent downstream.

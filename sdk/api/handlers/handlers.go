@@ -49,7 +49,6 @@ const idempotencyKeyMetadataKey = "idempotency_key"
 
 const (
 	defaultStreamingKeepAliveSeconds = 0
-	defaultStreamingBootstrapRetries = 0
 )
 
 type pinnedAuthContextKey struct{}
@@ -174,18 +173,6 @@ func NonStreamingKeepAliveInterval(cfg *config.SDKConfig) time.Duration {
 		return 0
 	}
 	return time.Duration(seconds) * time.Second
-}
-
-// StreamingBootstrapRetries returns how many times a streaming request may be retried before any bytes are sent.
-func StreamingBootstrapRetries(cfg *config.SDKConfig) int {
-	retries := defaultStreamingBootstrapRetries
-	if cfg != nil {
-		retries = cfg.Streaming.BootstrapRetries
-	}
-	if retries < 0 {
-		retries = 0
-	}
-	return retries
 }
 
 // PassthroughHeadersEnabled returns whether upstream response headers should be forwarded to clients.
@@ -725,9 +712,6 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 	go func() {
 		defer close(dataChan)
 		defer close(errChan)
-		sentPayload := false
-		bootstrapRetries := 0
-		maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
 
 		sendErr := func(msg *interfaces.ErrorMessage) bool {
 			if ctx == nil {
@@ -755,82 +739,47 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 			}
 		}
 
-		bootstrapEligible := func(err error) bool {
-			status := statusFromError(err)
-			if status == 0 {
-				return true
-			}
-			switch status {
-			case http.StatusUnauthorized, http.StatusForbidden, http.StatusPaymentRequired,
-				http.StatusRequestTimeout, http.StatusTooManyRequests:
-				return true
-			default:
-				return status >= http.StatusInternalServerError
-			}
-		}
-
-	outer:
 		for {
-			for {
-				var chunk coreexecutor.StreamChunk
-				var ok bool
-				if ctx != nil {
-					select {
-					case <-ctx.Done():
-						return
-					case chunk, ok = <-chunks:
-					}
-				} else {
-					chunk, ok = <-chunks
-				}
-				if !ok {
+			var chunk coreexecutor.StreamChunk
+			var ok bool
+			if ctx != nil {
+				select {
+				case <-ctx.Done():
 					return
+				case chunk, ok = <-chunks:
 				}
-				if chunk.Err != nil {
-					streamErr := chunk.Err
-					// Safe bootstrap recovery: if the upstream fails before any payload bytes are sent,
-					// retry a few times (to allow auth rotation / transient recovery) and then attempt model fallback.
-					if !sentPayload {
-						if bootstrapRetries < maxBootstrapRetries && bootstrapEligible(streamErr) {
-							bootstrapRetries++
-							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
-							if retryErr == nil {
-								if passthroughHeadersEnabled {
-									replaceHeader(upstreamHeaders, FilterUpstreamHeaders(retryResult.Headers))
-								}
-								chunks = retryResult.Chunks
-								continue outer
-							}
-							streamErr = enrichAuthSelectionError(retryErr, providers, normalizedModel)
-						}
+			} else {
+				chunk, ok = <-chunks
+			}
+			if !ok {
+				return
+			}
+			if chunk.Err != nil {
+				streamErr := chunk.Err
+				status := http.StatusInternalServerError
+				if se, ok := streamErr.(interface{ StatusCode() int }); ok && se != nil {
+					if code := se.StatusCode(); code > 0 {
+						status = code
 					}
-
-					status := http.StatusInternalServerError
-					if se, ok := streamErr.(interface{ StatusCode() int }); ok && se != nil {
-						if code := se.StatusCode(); code > 0 {
-							status = code
-						}
-					}
-					var addon http.Header
-					if he, ok := streamErr.(interface{ Headers() http.Header }); ok && he != nil {
-						if hdr := he.Headers(); hdr != nil {
-							addon = hdr.Clone()
-						}
-					}
-					_ = sendErr(&interfaces.ErrorMessage{StatusCode: status, Error: streamErr, Addon: addon})
-					return
 				}
-				if len(chunk.Payload) > 0 {
-					if handlerType == "openai-response" {
-						if err := validateSSEDataJSON(chunk.Payload); err != nil {
-							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err})
-							return
-						}
+				var addon http.Header
+				if he, ok := streamErr.(interface{ Headers() http.Header }); ok && he != nil {
+					if hdr := he.Headers(); hdr != nil {
+						addon = hdr.Clone()
 					}
-					sentPayload = true
-					if okSendData := sendData(cloneBytes(chunk.Payload)); !okSendData {
+				}
+				_ = sendErr(&interfaces.ErrorMessage{StatusCode: status, Error: streamErr, Addon: addon})
+				return
+			}
+			if len(chunk.Payload) > 0 {
+				if handlerType == "openai-response" {
+					if err := validateSSEDataJSON(chunk.Payload); err != nil {
+						_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err})
 						return
 					}
+				}
+				if okSendData := sendData(cloneBytes(chunk.Payload)); !okSendData {
+					return
 				}
 			}
 		}
@@ -865,18 +814,6 @@ func validateSSEDataJSON(chunk []byte) error {
 		return fmt.Errorf("invalid SSE data JSON (len=%d): %q", len(data), preview)
 	}
 	return nil
-}
-
-func statusFromError(err error) int {
-	if err == nil {
-		return 0
-	}
-	if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-		if code := se.StatusCode(); code > 0 {
-			return code
-		}
-	}
-	return 0
 }
 
 func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
@@ -964,15 +901,6 @@ func cloneHeader(src http.Header) http.Header {
 		dst[key] = append([]string(nil), values...)
 	}
 	return dst
-}
-
-func replaceHeader(dst http.Header, src http.Header) {
-	for key := range dst {
-		delete(dst, key)
-	}
-	for key, values := range src {
-		dst[key] = append([]string(nil), values...)
-	}
 }
 
 func enrichAuthSelectionError(err error, providers []string, model string) error {
