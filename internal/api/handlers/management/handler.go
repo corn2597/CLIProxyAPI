@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/riskcontrol"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -47,6 +48,8 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	postAuthPersistHook coreauth.PostAuthHook
+	pluginHost          *pluginhost.Host
 	riskBlockReader     riskcontrol.BlockEventReader
 }
 
@@ -124,6 +127,16 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 	h.mu.Unlock()
 }
 
+// SetPluginHost updates the plugin host used by plugin-backed management endpoints.
+func (h *Handler) SetPluginHost(host *pluginhost.Host) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.pluginHost = host
+	h.mu.Unlock()
+}
+
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
 func (h *Handler) SetLocalPassword(password string) { h.localPassword = password }
 
@@ -143,6 +156,11 @@ func (h *Handler) SetLogDirectory(dir string) {
 // SetPostAuthHook registers a hook to be called after auth record creation but before persistence.
 func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 	h.postAuthHook = hook
+}
+
+// SetPostAuthPersistHook registers a hook to be called after auth persistence.
+func (h *Handler) SetPostAuthPersistHook(hook coreauth.PostAuthHook) {
+	h.postAuthPersistHook = hook
 }
 
 // Middleware enforces access control for management endpoints.
