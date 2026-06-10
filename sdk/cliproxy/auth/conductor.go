@@ -943,6 +943,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if errCtx := ctx.Err(); errCtx != nil {
 					return nil, errCtx
 				}
+				if cliproxyexecutor.IsRequestScopedError(errStream) {
+					return nil, errStream
+				}
 				if bootstrapAttempt < maxBootstrapRetries && bootstrapRetryableError(errStream) {
 					if errWait := waitForCooldown(ctx, bootstrapRetryCooldown); errWait != nil {
 						return nil, errWait
@@ -964,6 +967,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if errCtx := ctx.Err(); errCtx != nil {
 					discardStreamChunks(streamResult.Chunks)
 					return nil, errCtx
+				}
+				if cliproxyexecutor.IsRequestScopedError(bootstrapErr) {
+					discardStreamChunks(streamResult.Chunks)
+					return nil, bootstrapErr
 				}
 				if bootstrapAttempt < maxBootstrapRetries && bootstrapRetryableError(bootstrapErr) {
 					discardStreamChunks(streamResult.Chunks)
@@ -1459,6 +1466,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
 				}
+				if cliproxyexecutor.IsRequestScopedError(errExec) {
+					return cliproxyexecutor.Response{}, errExec
+				}
 				result.Error = &Error{Message: errExec.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
 					result.Error.HTTPStatus = se.StatusCode()
@@ -1557,6 +1567,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
+				}
+				if cliproxyexecutor.IsRequestScopedError(errExec) {
+					return cliproxyexecutor.Response{}, errExec
 				}
 				result.Error = &Error{Message: errExec.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
@@ -2286,6 +2299,9 @@ func (m *Manager) retryAllowed(attempt int, providers []string) bool {
 
 func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []string, model string, maxWait time.Duration) (time.Duration, bool) {
 	if err == nil {
+		return 0, false
+	}
+	if cliproxyexecutor.IsRequestScopedError(err) {
 		return 0, false
 	}
 	if maxWait <= 0 {

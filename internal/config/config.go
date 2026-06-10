@@ -111,6 +111,11 @@ type Config struct {
 	// Codex defines a list of Codex API key configurations as specified in the YAML configuration file.
 	CodexKey []CodexKey `yaml:"codex-api-key" json:"codex-api-key"`
 
+	// Codex configures provider-wide Codex request behavior.
+	Codex CodexConfig `yaml:"codex" json:"codex"`
+
+	// RiskControl configures pre-upstream LLM-based audit checks.
+	RiskControl RiskControlConfig `yaml:"risk-control" json:"risk-control"`
 	// CodexHeaderDefaults configures fallback headers for Codex OAuth model requests.
 	// These are used only when the client does not send its own headers.
 	CodexHeaderDefaults CodexHeaderDefaults `yaml:"codex-header-defaults" json:"codex-header-defaults"`
@@ -170,6 +175,49 @@ type ClaudeHeaderDefaults struct {
 type CodexHeaderDefaults struct {
 	UserAgent    string `yaml:"user-agent" json:"user-agent"`
 	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
+}
+
+// CodexConfig configures provider-wide Codex request behavior.
+type CodexConfig struct {
+	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+}
+
+// RiskControlConfig configures LLM-based request auditing before provider execution.
+type RiskControlConfig struct {
+	// Enabled toggles risk-control checks. When false, the feature is inert.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Mode controls enforcement: "off", "observe", or "pre_block".
+	Mode string `yaml:"mode" json:"mode"`
+	// BaseURL is an OpenAI-compatible API base URL, usually ending in /v1.
+	BaseURL string `yaml:"base-url" json:"base-url"`
+	// Endpoint selects the OpenAI-compatible endpoint: "chat-completions" or "moderations".
+	Endpoint string `yaml:"endpoint" json:"endpoint"`
+	// Model is the audit model sent to the configured API endpoint.
+	Model string `yaml:"model" json:"model"`
+	// APIKey is the single audit API key. Prefer APIKeys for rotation.
+	APIKey string `yaml:"api-key" json:"-"`
+	// APIKeys are audit API keys rotated independently from provider OAuth pools.
+	APIKeys []string `yaml:"api-keys" json:"-"`
+	// TimeoutMS bounds the synchronous pre-upstream audit call.
+	TimeoutMS int `yaml:"timeout-ms" json:"timeout-ms"`
+	// FailPolicy controls audit backend failures: "open" allows, "closed" blocks.
+	FailPolicy string `yaml:"fail-policy" json:"fail-policy"`
+	// SessionAuditInterval controls per-session audit cadence. Default: 5m.
+	SessionAuditInterval string `yaml:"session-audit-interval" json:"session-audit-interval"`
+	// SessionTTL controls in-memory session state retention. Default: 24h.
+	SessionTTL string `yaml:"session-ttl" json:"session-ttl"`
+	// BlockedSessionTTL controls how long a blocked session ID remains banned. Default: 168h.
+	BlockedSessionTTL string `yaml:"blocked-session-ttl" json:"blocked-session-ttl"`
+	// MaxInputRunes limits text sent to the audit model. Default: 12000.
+	MaxInputRunes int `yaml:"max-input-runes" json:"max-input-runes"`
+	// MaxInputImages limits image references summarized for audit. Default: 1.
+	MaxInputImages int `yaml:"max-input-images" json:"max-input-images"`
+	// BlockStatus is the downstream HTTP status for pre_block decisions. Default: 403.
+	BlockStatus int `yaml:"block-status" json:"block-status"`
+	// BlockMessage is the user-visible message for pre_block decisions.
+	BlockMessage string `yaml:"block-message" json:"block-message"`
+	// Prompt optionally overrides the default chat-completions audit prompt.
+	Prompt string `yaml:"prompt" json:"prompt"`
 }
 
 // TLSConfig holds HTTPS server settings.

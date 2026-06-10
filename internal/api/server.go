@@ -34,6 +34,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/riskcontrol"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
@@ -284,6 +285,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	logDir := logging.ResolveLogDirectory(cfg)
 	s.mgmt.SetLogDirectory(logDir)
+	s.configureRiskControlBlockedEventStore(logDir)
 	if optionState.postAuthHook != nil {
 		s.mgmt.SetPostAuthHook(optionState.postAuthHook)
 	}
@@ -343,7 +345,7 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		}
 		if c != nil && c.Request != nil {
 			path := c.Request.URL.Path
-			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || path == "/management.html" {
+			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || path == "/management.html" || path == "/management-risk-control.html" {
 				c.Next()
 				return
 			}
@@ -372,6 +374,7 @@ func (s *Server) setupRoutes() {
 	s.engine.HEAD("/healthz", healthzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/management-risk-control.html", s.serveManagementRiskControlPage)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
@@ -610,6 +613,8 @@ func (s *Server) registerManagementRoutes() {
 
 		mgmt.GET("/logs", s.mgmt.GetLogs)
 		mgmt.DELETE("/logs", s.mgmt.DeleteLogs)
+		mgmt.GET("/risk-control/blocks", s.mgmt.GetRiskControlBlocks)
+		mgmt.GET("/risk-control/page", s.mgmt.GetRiskControlPage)
 		mgmt.GET("/request-error-logs", s.mgmt.GetRequestErrorLogs)
 		mgmt.GET("/request-error-logs/:name", s.mgmt.DownloadRequestErrorLog)
 		mgmt.GET("/request-log-by-id/:id", s.mgmt.GetRequestLogByID)
@@ -756,6 +761,32 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	}
 
 	c.File(filePath)
+}
+
+func (s *Server) serveManagementRiskControlPage(c *gin.Context) {
+	if s == nil || s.mgmt == nil || s.cfg == nil {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	if s.cfg.Home.Enabled || !s.managementRoutesEnabled.Load() {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	s.mgmt.GetRiskControlPage(c)
+}
+
+func (s *Server) configureRiskControlBlockedEventStore(logDir string) {
+	if strings.TrimSpace(logDir) == "" {
+		return
+	}
+	filePath := filepath.Join(logDir, "risk-control-blocks.json")
+	if err := riskcontrol.DefaultBlockedEventStore().ConfigurePersistence(filePath, 20); err != nil {
+		log.WithError(err).Warn("risk control: blocked-event store persistence configuration failed")
+	}
+	banFilePath := filepath.Join(logDir, "risk-control-session-bans.json")
+	if err := riskcontrol.ConfigureDefaultSessionBanStore(banFilePath); err != nil {
+		log.WithError(err).Warn("risk control: blocked-session persistence configuration failed")
+	}
 }
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {
@@ -1458,7 +1489,9 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	if s.mgmt != nil {
 		s.mgmt.SetConfig(cfg)
 		s.mgmt.SetAuthManager(s.handlers.AuthManager)
+		s.mgmt.SetLogDirectory(logging.ResolveLogDirectory(cfg))
 	}
+	s.configureRiskControlBlockedEventStore(logging.ResolveLogDirectory(cfg))
 
 	// Notify Amp module only when Amp config has changed.
 	ampConfigChanged := oldCfg == nil || !reflect.DeepEqual(oldCfg.AmpCode, cfg.AmpCode)

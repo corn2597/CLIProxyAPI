@@ -865,3 +865,80 @@ func TestManager_RequestScopedNotFoundStopsRetryWithoutSuspendingAuth(t *testing
 		t.Fatalf("expected request-scoped 404 to avoid bad auth model cooldown state, got %#v", state)
 	}
 }
+
+type testRequestScopedStatusError struct {
+	status  int
+	message string
+}
+
+func (e testRequestScopedStatusError) Error() string { return e.message }
+
+func (e testRequestScopedStatusError) StatusCode() int { return e.status }
+
+func (e testRequestScopedStatusError) RequestScoped() bool { return true }
+
+func TestManager_RequestScopedExecutorErrorStopsRetryWithoutSuspendingAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "openai",
+		executeErrors: map[string]error{
+			"aa-bad-auth-risk-scope": testRequestScopedStatusError{
+				status:  http.StatusForbidden,
+				message: "risk control blocked",
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "gpt-4.1-risk-scope"
+	badAuth := &Auth{ID: "aa-bad-auth-risk-scope", Provider: "openai"}
+	goodAuth := &Auth{ID: "bb-good-auth-risk-scope", Provider: "openai"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(badAuth.ID, "openai", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "openai", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), badAuth); errRegister != nil {
+		t.Fatalf("register bad auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), goodAuth); errRegister != nil {
+		t.Fatalf("register good auth: %v", errRegister)
+	}
+
+	_, errExecute := m.Execute(context.Background(), []string{"openai"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("expected request-scoped executor error")
+	}
+	if got := statusCodeFromError(errExecute); got != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", got, http.StatusForbidden)
+	}
+
+	got := executor.ExecuteCalls()
+	want := []string{badAuth.ID}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execute call %d auth = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	updatedBad, ok := m.GetByID(badAuth.ID)
+	if !ok || updatedBad == nil {
+		t.Fatalf("expected bad auth to remain registered")
+	}
+	if updatedBad.Unavailable {
+		t.Fatalf("expected request-scoped error to keep bad auth available")
+	}
+	if !updatedBad.NextRetryAfter.IsZero() {
+		t.Fatalf("expected request-scoped error to keep auth cooldown unset, got %v", updatedBad.NextRetryAfter)
+	}
+	if state := updatedBad.ModelStates[model]; state != nil {
+		t.Fatalf("expected request-scoped error to avoid model cooldown state, got %#v", state)
+	}
+}

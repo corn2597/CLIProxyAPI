@@ -126,6 +126,36 @@ routing:
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
 
+# Codex provider behavior.
+codex:
+  # When true, and routing.strategy is fill-first or routing.session-affinity is true,
+  # remap Codex prompt_cache_key and installation identity per selected auth.
+  # Some superstitious users believe request tracking identifiers can be used
+  # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
+  identity-confuse: false
+
+# LLM-based risk-control audit for Codex requests.
+# The audit client uses this OpenAI-compatible API config directly and does not
+# reuse Codex OAuth/file-backed auth pools. Internal audit requests carry a
+# bypass header so pointing base-url back to this proxy will not recursively
+# audit the audit request. Only use this behind a trusted internal boundary.
+# risk-control:
+#   enabled: false
+#   mode: "observe"                 # off, observe, pre_block
+#   base-url: "https://api.example.com/v1"
+#   endpoint: "chat-completions"    # chat-completions or moderations
+#   model: "audit-model"
+#   api-key: "sk-..."
+#   # api-keys: ["sk-1", "sk-2"]    # optional independent audit key rotation
+#   session-audit-interval: "5m"
+#   session-ttl: "24h"
+#   blocked-session-ttl: "168h"     # blacklist a blocked session_id for 7 days
+#   timeout-ms: 3000
+#   fail-policy: "open"             # open or closed
+#   block-status: 403
+#   block-message: "risk control audit blocked this request"
+#   max-input-runes: 12000
+#   max-input-images: 1
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true
 

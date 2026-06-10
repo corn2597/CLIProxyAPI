@@ -1,8 +1,12 @@
 package handlers
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/riskcontrol"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"golang.org/x/net/context"
 )
@@ -16,6 +20,43 @@ func TestRequestExecutionMetadataIncludesExecutionSessionWithoutIdempotencyKey(t
 	}
 	if _, ok := meta[idempotencyKeyMetadataKey]; ok {
 		t.Fatalf("unexpected idempotency key in metadata: %v", meta[idempotencyKeyMetadataKey])
+	}
+}
+
+func TestRequestExecutionMetadataRiskControlBypassUsesInternalHeader(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set(riskcontrol.InternalBypassHeader, "1")
+	ginCtx.Request = req
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	meta := requestExecutionMetadata(ctx)
+	if got := meta[coreexecutor.RiskControlBypassMetadataKey]; got != true {
+		t.Fatalf("RiskControlBypassMetadataKey = %v, want true; meta=%v", got, meta)
+	}
+}
+
+func TestHeadersFromContextStripsRiskControlBypassHeader(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("X-Keep", "1")
+	riskcontrol.AddInternalBypassHeader(req.Header)
+	ginCtx.Request = req
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	headers := headersFromContext(ctx)
+	if got := headers.Get(riskcontrol.InternalBypassHeader); got != "" {
+		t.Fatalf("forwarded bypass header = %q, want empty", got)
+	}
+	if got := headers.Get("X-Keep"); got != "1" {
+		t.Fatalf("forwarded X-Keep = %q, want 1", got)
+	}
+	if got := req.Header.Get(riskcontrol.InternalBypassHeader); got == "" {
+		t.Fatalf("original request header was mutated")
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/riskcontrol"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -186,12 +187,16 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// Only include it if the client explicitly provides it.
 	key := ""
 	requestPath := ""
+	riskControlBypass := false
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
 			requestPath = strings.TrimSpace(ginCtx.FullPath())
 			if requestPath == "" && ginCtx.Request.URL != nil {
 				requestPath = strings.TrimSpace(ginCtx.Request.URL.Path)
+			}
+			if riskcontrol.HasValidInternalBypassHeader(ginCtx.Request.Header) {
+				riskControlBypass = true
 			}
 		}
 	}
@@ -202,6 +207,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	}
 	if requestPath != "" {
 		meta[coreexecutor.RequestPathMetadataKey] = requestPath
+	}
+	if riskControlBypass {
+		meta[coreexecutor.RiskControlBypassMetadataKey] = true
 	}
 	if pinnedAuthID := pinnedAuthIDFromContext(ctx); pinnedAuthID != "" {
 		meta[coreexecutor.PinnedAuthMetadataKey] = pinnedAuthID
@@ -237,7 +245,9 @@ func headersFromContext(ctx context.Context) http.Header {
 		return nil
 	}
 	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-		return ginCtx.Request.Header.Clone()
+		headers := ginCtx.Request.Header.Clone()
+		riskcontrol.StripInternalBypassHeader(headers)
+		return headers
 	}
 	return nil
 }
