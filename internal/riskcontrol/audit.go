@@ -143,13 +143,13 @@ func recordCodexBlockedEvent(now time.Time, settings settings, sessionID string,
 
 func bestAuditInput(format sdktranslator.Format, settings settings, payloads ...[]byte) AuditInput {
 	for _, payload := range payloads {
-		input := ExtractFullUserInput(format, payload, settings.maxInputRunes, settings.maxInputImages)
+		input := ExtractLatestEffectiveUserInput(format, payload, settings.maxInputRunes, settings.maxInputImages)
 		if !input.Empty() {
 			return input
 		}
 	}
 	for _, payload := range payloads {
-		input := ExtractFullUserInput(sdktranslator.FormatCodex, payload, settings.maxInputRunes, settings.maxInputImages)
+		input := ExtractLatestEffectiveUserInput(sdktranslator.FormatCodex, payload, settings.maxInputRunes, settings.maxInputImages)
 		if !input.Empty() {
 			return input
 		}
@@ -220,9 +220,43 @@ func callAuditAPI(ctx context.Context, cfg *config.Config, settings settings, se
 		return Decision{}, errRead
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if decision, ok := decisionFromAuditHTTPError(settings, raw); ok {
+			return decision, nil
+		}
 		return Decision{}, fmt.Errorf("risk control audit HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	return parseAuditDecision(settings, raw)
+}
+
+func decisionFromAuditHTTPError(settings settings, raw []byte) (Decision, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || !gjson.ValidBytes(trimmed) {
+		return Decision{}, false
+	}
+	if code := strings.TrimSpace(gjson.GetBytes(trimmed, "error.code").String()); code != "risk_control_blocked" {
+		return Decision{}, false
+	}
+	message := strings.TrimSpace(gjson.GetBytes(trimmed, "error.message").String())
+	return Decision{
+		Blocked: true,
+		Reason:  normalizeBlockedReason(settings, message),
+	}, true
+}
+
+func normalizeBlockedReason(settings settings, message string) string {
+	trimmed := strings.TrimSpace(message)
+	if trimmed == "" {
+		return ""
+	}
+	for _, prefix := range []string{strings.TrimSpace(settings.blockMessage), defaultBlockMessage} {
+		if prefix == "" || !strings.HasPrefix(trimmed, prefix) {
+			continue
+		}
+		reason := strings.TrimSpace(strings.TrimPrefix(trimmed, prefix))
+		reason = strings.TrimSpace(strings.TrimPrefix(reason, ":"))
+		return reason
+	}
+	return trimmed
 }
 
 func auditRequestBody(settings settings, sessionID string, model string, input AuditInput) ([]byte, error) {
@@ -233,16 +267,12 @@ func auditRequestBody(settings settings, sessionID string, model string, input A
 			"input": auditInputText(sessionID, model, input),
 		})
 	default:
-		prompt := settings.prompt
-		if prompt == "" {
-			prompt = defaultAuditPrompt()
-		}
 		return json.Marshal(map[string]any{
 			"model":       settings.model,
 			"temperature": 0,
 			"stream":      false,
 			"messages": []map[string]string{
-				{"role": "system", "content": prompt},
+				{"role": "system", "content": defaultAuditPrompt()},
 				{"role": "user", "content": auditInputText(sessionID, model, input)},
 			},
 		})
@@ -251,11 +281,27 @@ func auditRequestBody(settings settings, sessionID string, model string, input A
 
 func defaultAuditPrompt() string {
 	return strings.Join([]string{
-		"You are a risk-control auditor for user prompts.",
-		"Audit only the supplied user-authored content.",
+		"You are a request auditor enforcing OpenAI Usage Policies.",
+		"Policy source: " + openAIUsagePolicySource + ".",
+		"Policy version: " + openAIUsagePolicyVersion + ".",
+		"Policy profile: " + openAIUsagePolicyProfile + ".",
+		"Audit only the supplied end-user request excerpt. Default to allow.",
+		"Block only when the user's primary request clearly asks for assistance with one of these policy codes:",
+		"- sexual_minors_or_grooming",
+		"- sexual_violence_or_nonconsensual_intimate_content",
+		"- self_harm_promotion_or_facilitation",
+		"- violent_wrongdoing_or_terror_assistance",
+		"- weapons_development_or_use_assistance",
+		"- malicious_cyber_or_system_compromise",
+		"- privacy_compromise_or_sensitive_data_abuse",
+		"- fraud_scams_or_impersonation",
+		"- safeguard_circumvention",
+		"- unsolicited_safety_testing",
+		"Do not block adult sexual content, consensual erotica, trading or finance questions, coding, ssh or sysadmin requests, debugging, translations, analysis, quotations, or safety-policy discussion.",
+		"If the request is ambiguous, contextual, quoted, analytical, or benign, return allow.",
 		"Return compact JSON only with this schema:",
-		`{"action":"allow|block","flagged":true|false,"reason":"short reason","categories":["category"]}`,
-		"Use block only for clearly unsafe or policy-violating user requests.",
+		`{"action":"allow|block","policy_code":"none|sexual_minors_or_grooming|sexual_violence_or_nonconsensual_intimate_content|self_harm_promotion_or_facilitation|violent_wrongdoing_or_terror_assistance|weapons_development_or_use_assistance|malicious_cyber_or_system_compromise|privacy_compromise_or_sensitive_data_abuse|fraud_scams_or_impersonation|safeguard_circumvention|unsolicited_safety_testing","confidence":"high|medium|low","reason":"short reason"}`,
+		"When allowing, set policy_code to none.",
 	}, "\n")
 }
 
@@ -328,12 +374,15 @@ func newAuditHTTPClient(_ context.Context, cfg *config.Config, timeout time.Dura
 
 func parseAuditDecision(settings settings, raw []byte) (Decision, error) {
 	if flagged := gjson.GetBytes(raw, "results.0.flagged"); flagged.Exists() {
-		reason := highestModerationCategory(raw)
-		return Decision{Blocked: flagged.Bool(), Reason: reason}, nil
+		policyCode := moderationPolicyCodeFromResponse(raw)
+		if policyCode == "" {
+			return Decision{Blocked: false}, nil
+		}
+		return Decision{Blocked: true, Reason: policyCode}, nil
 	}
 	content := strings.TrimSpace(gjson.GetBytes(raw, "choices.0.message.content").String())
 	if content == "" {
-		if gjson.GetBytes(raw, "flagged").Exists() || gjson.GetBytes(raw, "action").Exists() {
+		if gjson.GetBytes(raw, "action").Exists() || gjson.GetBytes(raw, "policy_code").Exists() || gjson.GetBytes(raw, "policyCode").Exists() {
 			content = string(raw)
 		} else {
 			return Decision{}, fmt.Errorf("risk control: audit response missing decision content")
@@ -343,30 +392,77 @@ func parseAuditDecision(settings settings, raw []byte) (Decision, error) {
 	if jsonContent == "" {
 		return Decision{}, fmt.Errorf("risk control: audit decision is not JSON")
 	}
-	action := strings.ToLower(strings.TrimSpace(gjson.Get(jsonContent, "action").String()))
-	flagged := gjson.Get(jsonContent, "flagged").Bool()
-	blocked := flagged || action == "block" || action == "blocked" || action == "deny"
-	reason := strings.TrimSpace(gjson.Get(jsonContent, "reason").String())
-	if reason == "" {
-		reason = strings.TrimSpace(gjson.Get(jsonContent, "category").String())
+	action := normalizeAuditAction(gjson.Get(jsonContent, "action").String())
+	switch action {
+	case "allow":
+		return Decision{Blocked: false}, nil
+	case "block":
+		policyCode := extractAuditPolicyCode(jsonContent)
+		if !isOpenAIHardStopPolicyCode(policyCode) {
+			return Decision{}, fmt.Errorf("risk control: unsupported policy_code %q", policyCode)
+		}
+		confidence := normalizeAuditConfidence(gjson.Get(jsonContent, "confidence").String())
+		if confidence != "high" {
+			return Decision{}, fmt.Errorf("risk control: insufficient block confidence %q for policy_code %q", confidence, normalizePolicyCode(policyCode))
+		}
+		reason := strings.TrimSpace(gjson.Get(jsonContent, "reason").String())
+		if reason == "" {
+			reason = normalizePolicyCode(policyCode)
+		}
+		return Decision{Blocked: true, Reason: reason}, nil
+	default:
+		return Decision{}, fmt.Errorf("risk control: audit response missing valid action")
 	}
-	return Decision{Blocked: blocked, Reason: reason}, nil
 }
 
-func highestModerationCategory(raw []byte) string {
+func moderationPolicyCodeFromResponse(raw []byte) string {
 	categories := gjson.GetBytes(raw, "results.0.categories")
 	if !categories.IsObject() {
 		return ""
 	}
-	var out string
-	categories.ForEach(func(key, value gjson.Result) bool {
-		if value.Bool() {
-			out = key.String()
-			return false
+	for _, key := range []string{
+		"sexual/minors",
+		"self-harm/instructions",
+		"illicit/violent",
+	} {
+		if categories.Get(key).Bool() {
+			return moderationCategoryPolicyCode(key)
 		}
-		return true
-	})
-	return out
+	}
+	return ""
+}
+
+func normalizeAuditAction(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "allow", "allowed", "ok":
+		return "allow"
+	case "block", "blocked", "deny", "denied":
+		return "block"
+	default:
+		return ""
+	}
+}
+
+func normalizeAuditConfidence(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "high":
+		return "high"
+	case "medium", "med":
+		return "medium"
+	case "low":
+		return "low"
+	default:
+		return ""
+	}
+}
+
+func extractAuditPolicyCode(jsonContent string) string {
+	for _, path := range []string{"policy_code", "policyCode", "category", "categories.0"} {
+		if value := strings.TrimSpace(gjson.Get(jsonContent, path).String()); value != "" {
+			return normalizePolicyCode(value)
+		}
+	}
+	return ""
 }
 
 func extractJSONObject(content string) string {

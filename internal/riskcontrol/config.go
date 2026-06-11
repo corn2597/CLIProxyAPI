@@ -46,7 +46,6 @@ type settings struct {
 	maxInputImages       int
 	blockStatus          int
 	blockMessage         string
-	prompt               string
 }
 
 func normalizeSettings(cfg *config.Config) settings {
@@ -127,7 +126,6 @@ func normalizeSettings(cfg *config.Config) settings {
 		maxInputImages:       maxImages,
 		blockStatus:          blockStatus,
 		blockMessage:         blockMessage,
-		prompt:               strings.TrimSpace(raw.Prompt),
 	}
 }
 

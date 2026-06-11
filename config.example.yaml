@@ -177,6 +177,8 @@ codex:
 #   block-message: "risk control audit blocked this request"
 #   max-input-runes: 12000
 #   max-input-images: 1
+#   # prompt is deprecated and ignored; the server uses an internal OpenAI policy profile
+#   # prompt: "..."
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true

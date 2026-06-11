@@ -18,8 +18,52 @@ type AuditInput struct {
 	Hash         string
 }
 
+type auditTurn struct {
+	Text   string
+	Images []string
+}
+
+const defaultAuditContextBackfillTurns = 2
+
 func (i AuditInput) Empty() bool {
 	return strings.TrimSpace(i.Text) == "" && len(i.Images) == 0
+}
+
+// ExtractLatestEffectiveUserInput collects the latest user intent, with small user-only backfill for continuation prompts.
+func ExtractLatestEffectiveUserInput(format sdktranslator.Format, payload []byte, maxRunes int, maxImages int) AuditInput {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return AuditInput{}
+	}
+	turns := collectUserTurns(format, payload)
+	turns = sanitizeAuditTurns(turns)
+	selected := selectEffectiveAuditTurns(turns, defaultAuditContextBackfillTurns)
+	if len(selected) == 0 {
+		return AuditInput{}
+	}
+
+	parts := make([]string, 0, len(selected))
+	images := make([]string, 0, maxImages)
+	messages := 0
+	for _, turn := range selected {
+		if strings.TrimSpace(turn.Text) == "" && len(turn.Images) == 0 {
+			continue
+		}
+		if turn.Text != "" {
+			parts = append(parts, turn.Text)
+		}
+		for _, image := range turn.Images {
+			addImageURL(&images, image, maxImages)
+		}
+		messages++
+	}
+	text := truncateRunes(normalizeAuditText(strings.Join(parts, "\n\n")), maxRunes)
+	hash := sha256.Sum256([]byte(text + "\n" + strings.Join(images, "\n")))
+	return AuditInput{
+		Text:         text,
+		Images:       images,
+		MessageCount: messages,
+		Hash:         hex.EncodeToString(hash[:]),
+	}
 }
 
 // ExtractFullUserInput collects all user-role content from the request payload.
@@ -54,6 +98,49 @@ func ExtractFullUserInput(format sdktranslator.Format, payload []byte, maxRunes 
 	}
 }
 
+func collectUserTurns(format sdktranslator.Format, payload []byte) []auditTurn {
+	switch strings.ToLower(strings.TrimSpace(format.String())) {
+	case sdktranslator.FormatOpenAI.String():
+		return collectRoleMessageTurns(gjson.GetBytes(payload, "messages"), "user")
+	case sdktranslator.FormatOpenAIResponse.String(), "responses", "openai-responses":
+		return collectResponsesUserTurns(gjson.GetBytes(payload, "input"))
+	case sdktranslator.FormatClaude.String():
+		return collectRoleMessageTurns(gjson.GetBytes(payload, "messages"), "user")
+	case sdktranslator.FormatGemini.String(), sdktranslator.FormatGeminiCLI.String():
+		return collectGeminiUserTurns(gjson.GetBytes(payload, "contents"))
+	default:
+		var turns []auditTurn
+		turns = append(turns, collectRoleMessageTurns(gjson.GetBytes(payload, "messages"), "user")...)
+		turns = append(turns, collectResponsesUserTurns(gjson.GetBytes(payload, "input"))...)
+		turns = append(turns, collectGeminiUserTurns(gjson.GetBytes(payload, "contents"))...)
+		return turns
+	}
+}
+
+func collectRoleMessageTurns(messages gjson.Result, role string) []auditTurn {
+	if !messages.IsArray() {
+		return nil
+	}
+	turns := make([]auditTurn, 0, 4)
+	messages.ForEach(func(_, item gjson.Result) bool {
+		if strings.ToLower(strings.TrimSpace(item.Get("role").String())) != role {
+			return true
+		}
+		var parts []string
+		var images []string
+		collectContentValue(item.Get("content"), &parts, &images, 0)
+		if len(parts) == 0 && len(images) == 0 {
+			return true
+		}
+		turns = append(turns, auditTurn{
+			Text:   strings.Join(parts, "\n"),
+			Images: images,
+		})
+		return true
+	})
+	return turns
+}
+
 func collectOpenAIChatUsers(messages gjson.Result, parts *[]string, images *[]string, maxImages int) int {
 	return collectRoleMessages(messages, "user", parts, images, maxImages)
 }
@@ -76,6 +163,30 @@ func collectRoleMessages(messages gjson.Result, role string, parts *[]string, im
 		return true
 	})
 	return count
+}
+
+func collectResponsesUserTurns(input gjson.Result) []auditTurn {
+	if !input.Exists() {
+		return nil
+	}
+	switch {
+	case input.Type == gjson.String:
+		return []auditTurn{{Text: input.String()}}
+	case input.IsArray():
+		turns := make([]auditTurn, 0, 4)
+		input.ForEach(func(_, item gjson.Result) bool {
+			if turn, ok := collectResponsesUserTurn(item); ok {
+				turns = append(turns, turn)
+			}
+			return true
+		})
+		return turns
+	case input.IsObject():
+		if turn, ok := collectResponsesUserTurn(input); ok {
+			return []auditTurn{turn}
+		}
+	}
+	return nil
 }
 
 func collectResponsesUsers(input gjson.Result, parts *[]string, images *[]string, maxImages int) int {
@@ -103,6 +214,41 @@ func collectResponsesUsers(input gjson.Result, parts *[]string, images *[]string
 	return 0
 }
 
+func collectResponsesUserTurn(item gjson.Result) (auditTurn, bool) {
+	if item.Type == gjson.String {
+		if strings.TrimSpace(item.String()) == "" {
+			return auditTurn{}, false
+		}
+		return auditTurn{Text: item.String()}, true
+	}
+	if !item.IsObject() {
+		return auditTurn{}, false
+	}
+	role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
+	itemType := strings.ToLower(strings.TrimSpace(item.Get("type").String()))
+	if role != "" && role != "user" {
+		return auditTurn{}, false
+	}
+	if role == "" && itemType != "input_text" && itemType != "text" {
+		return auditTurn{}, false
+	}
+	var parts []string
+	var images []string
+	if item.Get("content").Exists() {
+		collectContentValue(item.Get("content"), &parts, &images, 0)
+	}
+	if itemType == "input_text" || itemType == "text" || item.Get("text").Exists() {
+		collectContentValue(item, &parts, &images, 0)
+	}
+	if len(parts) == 0 && len(images) == 0 {
+		return auditTurn{}, false
+	}
+	return auditTurn{
+		Text:   strings.Join(parts, "\n"),
+		Images: images,
+	}, true
+}
+
 func collectResponsesUserItem(item gjson.Result, parts *[]string, images *[]string, maxImages int) bool {
 	if item.Type == gjson.String {
 		addAuditText(parts, item.String())
@@ -128,6 +274,36 @@ func collectResponsesUserItem(item gjson.Result, parts *[]string, images *[]stri
 		collectContentValue(item, parts, images, maxImages)
 	}
 	return len(*parts) > beforeParts || len(*images) > beforeImages
+}
+
+func collectGeminiUserTurns(contents gjson.Result) []auditTurn {
+	if !contents.IsArray() {
+		return nil
+	}
+	turns := make([]auditTurn, 0, 4)
+	contents.ForEach(func(_, item gjson.Result) bool {
+		role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
+		if role != "" && role != "user" {
+			return true
+		}
+		var parts []string
+		var images []string
+		if arr := item.Get("parts"); arr.IsArray() {
+			arr.ForEach(func(_, part gjson.Result) bool {
+				collectGeminiPart(part, &parts, &images, 0)
+				return true
+			})
+		}
+		if len(parts) == 0 && len(images) == 0 {
+			return true
+		}
+		turns = append(turns, auditTurn{
+			Text:   strings.Join(parts, "\n"),
+			Images: images,
+		})
+		return true
+	})
+	return turns
 }
 
 func collectGeminiUsers(contents gjson.Result, parts *[]string, images *[]string, maxImages int) int {
@@ -211,6 +387,156 @@ func addAuditText(parts *[]string, text string) {
 		return
 	}
 	*parts = append(*parts, text)
+}
+
+func sanitizeAuditTurns(turns []auditTurn) []auditTurn {
+	out := make([]auditTurn, 0, len(turns))
+	for _, turn := range turns {
+		turn.Text = normalizeAuditText(stripHostScaffolding(turn.Text))
+		if strings.TrimSpace(turn.Text) == "" && len(turn.Images) == 0 {
+			continue
+		}
+		out = append(out, turn)
+	}
+	return out
+}
+
+func selectEffectiveAuditTurns(turns []auditTurn, maxBackfill int) []auditTurn {
+	if len(turns) == 0 {
+		return nil
+	}
+	latestIdx := -1
+	for i := len(turns) - 1; i >= 0; i-- {
+		if strings.TrimSpace(turns[i].Text) != "" || len(turns[i].Images) > 0 {
+			latestIdx = i
+			break
+		}
+	}
+	if latestIdx < 0 {
+		return nil
+	}
+	selected := []auditTurn{turns[latestIdx]}
+	if !shouldBackfillReferencedContext(turns[latestIdx].Text) || maxBackfill <= 0 {
+		return selected
+	}
+	for i, used := latestIdx-1, 0; i >= 0 && used < maxBackfill; i-- {
+		if strings.TrimSpace(turns[i].Text) == "" && len(turns[i].Images) == 0 {
+			continue
+		}
+		selected = append([]auditTurn{turns[i]}, selected...)
+		used++
+	}
+	return selected
+}
+
+func shouldBackfillReferencedContext(text string) bool {
+	trimmed := strings.TrimSpace(strings.ToLower(text))
+	if trimmed == "" {
+		return false
+	}
+	if len([]rune(trimmed)) > 160 {
+		return false
+	}
+	for _, marker := range []string{
+		"continue",
+		"go on",
+		"keep going",
+		"same as above",
+		"based on above",
+		"as above",
+		"continue with",
+		"finish it",
+		"complete it",
+		"turn that into",
+		"convert that to",
+		"继续",
+		"接着",
+		"按上面",
+		"照上面",
+		"基于上面",
+		"按前面",
+		"接上",
+		"补全",
+		"细化",
+		"展开",
+		"继续写",
+		"改成脚本",
+		"改成 bash",
+		"改成 python",
+	} {
+		if strings.Contains(trimmed, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func stripHostScaffolding(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+
+	if extracted := extractAfterLastMarker(text, []string{
+		"User prompt:\n",
+		"## My request for Codex:\n",
+		"My request for Codex:\n",
+	}); extracted != "" && extracted != text {
+		text = extracted
+	}
+
+	for _, tag := range [][2]string{
+		{"<INSTRUCTIONS>", "</INSTRUCTIONS>"},
+		{"<environment_context>", "</environment_context>"},
+		{"<permissions instructions>", "</permissions instructions>"},
+		{"<app-context>", "</app-context>"},
+		{"<collaboration_mode>", "</collaboration_mode>"},
+		{"<skills_instructions>", "</skills_instructions>"},
+		{"<plugins_instructions>", "</plugins_instructions>"},
+	} {
+		text = removeTaggedBlock(text, tag[0], tag[1])
+	}
+
+	lines := strings.Split(text, "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "# AGENTS.md instructions for ") {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	return strings.TrimSpace(strings.Join(filtered, "\n"))
+}
+
+func extractAfterLastMarker(text string, markers []string) string {
+	best := -1
+	bestMarkerLen := 0
+	for _, marker := range markers {
+		if idx := strings.LastIndex(text, marker); idx >= 0 && idx >= best {
+			best = idx
+			bestMarkerLen = len(marker)
+		}
+	}
+	if best < 0 {
+		return text
+	}
+	return strings.TrimSpace(text[best+bestMarkerLen:])
+}
+
+func removeTaggedBlock(text string, startTag string, endTag string) string {
+	for {
+		start := strings.Index(text, startTag)
+		if start < 0 {
+			return text
+		}
+		end := strings.Index(text[start+len(startTag):], endTag)
+		if end < 0 {
+			return text
+		}
+		end += start + len(startTag) + len(endTag)
+		text = text[:start] + text[end:]
+	}
 }
 
 func addImageResult(images *[]string, data gjson.Result, mediaType string, maxImages int) {

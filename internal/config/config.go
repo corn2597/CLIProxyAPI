@@ -301,7 +301,7 @@ type RiskControlConfig struct {
 	BlockStatus int `yaml:"block-status" json:"block-status"`
 	// BlockMessage is the user-visible message for pre_block decisions.
 	BlockMessage string `yaml:"block-message" json:"block-message"`
-	// Prompt optionally overrides the default chat-completions audit prompt.
+	// Prompt is deprecated and ignored. Risk control uses an internal OpenAI policy profile.
 	Prompt string `yaml:"prompt" json:"prompt"`
 }
 
