@@ -25,7 +25,7 @@ const (
 	defaultSessionAuditInterval = 5 * time.Minute
 	defaultSessionTTL           = 24 * time.Hour
 	defaultBlockedSessionTTL    = 7 * 24 * time.Hour
-	defaultBlockThreshold       = 0.97
+	defaultBlockThreshold       = 0.99
 	defaultMaxInputRunes        = 0
 	defaultMaxInputImages       = 0
 	defaultBlockStatus          = http.StatusForbidden
@@ -106,6 +106,9 @@ func normalizeSettings(cfg *config.Config) settings {
 
 	blockThreshold := raw.BlockThreshold
 	if blockThreshold <= 0 || blockThreshold > 1 {
+		blockThreshold = defaultBlockThreshold
+	}
+	if blockThreshold < defaultBlockThreshold {
 		blockThreshold = defaultBlockThreshold
 	}
 

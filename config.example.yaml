@@ -171,7 +171,8 @@ codex:
 #   session-audit-interval: "5m"
 #   session-ttl: "24h"
 #   blocked-session-ttl: "168h"     # blacklist a blocked session_id for 7 days
-#   block-threshold: 0.97
+#   allow-session-ttl: "1h"         # manual allow-session override lifetime
+#   block-threshold: 0.99             # values below 0.99 are raised to 0.99
 #   timeout-ms: 3000
 #   fail-policy: "open"             # open or closed
 #   block-status: 403

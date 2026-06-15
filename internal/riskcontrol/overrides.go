@@ -104,6 +104,7 @@ func (s *OverrideStore) AllowSession(sessionID string, inputHash string, sourceB
 	if s == nil {
 		return ManualOverride{}, nil
 	}
+	now = now.UTC()
 	override := sanitizeOverride(ManualOverride{
 		Kind:               OverrideAllowSession,
 		SessionID:          sessionID,
@@ -115,6 +116,9 @@ func (s *OverrideStore) AllowSession(sessionID string, inputHash string, sourceB
 	})
 	if override.SessionID == "" {
 		return ManualOverride{}, nil
+	}
+	if override.ExpiresAt.IsZero() || !now.Before(override.ExpiresAt) {
+		return ManualOverride{}, errors.New("session allow override requires a future expires_at")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -164,6 +168,10 @@ func (s *OverrideStore) matchLocked(key string, now time.Time) (ManualOverride, 
 		return ManualOverride{}, false, false
 	}
 	if !override.ExpiresAt.IsZero() && !now.Before(override.ExpiresAt) {
+		delete(s.entries, key)
+		return ManualOverride{}, false, true
+	}
+	if override.Kind == OverrideAllowSession && override.ExpiresAt.IsZero() {
 		delete(s.entries, key)
 		return ManualOverride{}, false, true
 	}
@@ -221,6 +229,9 @@ func (s *OverrideStore) ensureLoadedLocked() error {
 		}
 		switch item.Kind {
 		case OverrideAllowSession:
+			if item.ExpiresAt.IsZero() {
+				continue
+			}
 			s.entries[sessionKey(item.SessionID)] = item
 		case OverrideAllowOnce:
 			if item.RemainingUses > 0 {

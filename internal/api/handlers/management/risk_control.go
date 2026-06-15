@@ -148,11 +148,11 @@ func (h *Handler) riskSamples() *riskcontrol.SampleStore {
 }
 
 func (h *Handler) sessionOverrideTTL() time.Duration {
-	const fallback = 7 * 24 * time.Hour
+	const fallback = time.Hour
 	if h == nil || h.cfg == nil {
 		return fallback
 	}
-	raw := strings.TrimSpace(h.cfg.RiskControl.BlockedSessionTTL)
+	raw := strings.TrimSpace(h.cfg.RiskControl.AllowSessionTTL)
 	if raw == "" {
 		return fallback
 	}

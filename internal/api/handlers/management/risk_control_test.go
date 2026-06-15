@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/riskcontrol"
 )
 
@@ -165,6 +166,7 @@ func TestPostRiskControlAllowSessionCreatesOverrideAndSample(t *testing.T) {
 		riskBlockStore:    store,
 		riskOverrideStore: overrides,
 		riskSampleStore:   samples,
+		cfg:               &config.Config{RiskControl: config.RiskControlConfig{AllowSessionTTL: "30m"}},
 	}
 	h.PostRiskControlAllowSession(c)
 
@@ -176,5 +178,10 @@ func TestPostRiskControlAllowSessionCreatesOverrideAndSample(t *testing.T) {
 		t.Fatalf("Match: %v", err)
 	} else if !ok {
 		t.Fatal("expected session override to be persisted")
+	}
+	if _, ok, err := overrides.Match("", "execution:session-two", time.Now().UTC().Add(31*time.Minute)); err != nil {
+		t.Fatalf("Match after TTL: %v", err)
+	} else if ok {
+		t.Fatal("session override should expire after configured TTL")
 	}
 }
