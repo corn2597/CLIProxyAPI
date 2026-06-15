@@ -470,6 +470,57 @@ func TestEnsureCodexAllowedDowngradesHighFalsePositivePolicyToObserve(t *testing
 	}
 }
 
+func TestEnsureCodexAllowedTreatsObserveNoneAsAllow(t *testing.T) {
+	oldTracker := defaultTracker
+	defaultTracker = NewSessionTracker()
+	t.Cleanup(func() { defaultTracker = oldTracker })
+	oldBlockedStore := defaultBlockedEventStore
+	defaultBlockedEventStore = NewBlockEventStore(16)
+	t.Cleanup(func() { defaultBlockedEventStore = oldBlockedStore })
+	oldObserveStore := defaultObserveEventStore
+	defaultObserveEventStore = NewBlockEventStore(16)
+	t.Cleanup(func() { defaultObserveEventStore = oldObserveStore })
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":false,\"decision\":\"observe\",\"policy_code\":\"none\",\"subcategory_code\":\"none\",\"confidence\":0.96,\"authorized_context\":\"authorized\",\"malicious_intent\":false,\"evidence\":[\"整理本地技能\"],\"reason\":\"整理本地技能\"}"}]}]}`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{RiskControl: config.RiskControlConfig{
+		Enabled:              true,
+		Mode:                 ModePreBlock,
+		BaseURL:              server.URL + "/v1",
+		Model:                "audit-model",
+		SessionAuditInterval: "5m",
+		BlockedSessionTTL:    "168h",
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"input":[{"role":"user","content":"整理一下本地 Codex skill"}],"metadata":{"session_id":"observe-none-session"}}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+	}
+
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
+		t.Fatalf("observe none decision should be treated as allow: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("audit calls = %d, want 1", got)
+	}
+	blockPage := defaultBlockedEventStore.ListBlockedEvents(BlockEventListOptions{Limit: 10})
+	if blockPage.Returned != 0 {
+		t.Fatalf("blocked event count = %d, want 0", blockPage.Returned)
+	}
+	observePage := defaultObserveEventStore.ListBlockedEvents(BlockEventListOptions{Limit: 10})
+	if observePage.Returned != 0 {
+		t.Fatalf("observe event count = %d, want 0", observePage.Returned)
+	}
+}
+
 func TestEnsureCodexAllowedStillBlocksEnforcedCyberCategory(t *testing.T) {
 	oldTracker := defaultTracker
 	defaultTracker = NewSessionTracker()

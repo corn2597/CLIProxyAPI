@@ -479,6 +479,15 @@ func parseAuditDecision(settings settings, raw []byte) (Decision, error) {
 		}
 		policyCode := extractAuditPolicyCode(jsonContent)
 		subcategoryCode := extractAuditSubcategoryCode(jsonContent)
+		if policyCode == "" || policyCode == "none" || subcategoryCode == "" || subcategoryCode == "none" {
+			return Decision{Blocked: false}, nil
+		}
+		if !isOpenAIHardStopPolicyCode(policyCode) {
+			return Decision{}, fmt.Errorf("risk control: unsupported observe policy_code %q", policyCode)
+		}
+		if !isOpenAIHardStopSubcategoryCode(subcategoryCode) {
+			return Decision{}, fmt.Errorf("risk control: unsupported observe subcategory_code %q", subcategoryCode)
+		}
 		confidence, _ := extractAuditConfidence(jsonContent)
 		reason := strings.TrimSpace(gjson.Get(jsonContent, "reason").String())
 		if reason == "" {

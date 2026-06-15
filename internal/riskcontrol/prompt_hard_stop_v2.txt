@@ -80,11 +80,13 @@
   - decision="allow" 或 "observe"
   - allow 表示明确放行；observe 表示模型认为可能违规但属于高误杀/不应自动 403 的场景
   - allow 时 policy_code="none"，subcategory_code="none"
-  - observe 时可以保留 policy_code / subcategory_code / confidence / evidence 供人工标注
+  - policy_code="none" 或 subcategory_code="none" 时，decision 必须是 "allow"，严禁输出 "observe"
+  - observe 时必须保留非 none 的 policy_code / subcategory_code / confidence / evidence 供人工标注
   - confidence 可以为 0 到 1
   - authorized_context 可以为 "unknown"
   - malicious_intent 可以为 true 或 false
   - reason 可以为空；observe 时 reason 应简短说明为什么进入人工观察
+  - 正常开发、运维、调试、部署、工具调研、整理 skill、清理工作空间、查看本地文件、文档整理、法律工作流规划等普通任务必须 allow，不得 observe
 - flagged=true 时：
   - decision="block"
   - policy_code 必须为非 none
