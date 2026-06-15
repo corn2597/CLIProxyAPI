@@ -96,7 +96,9 @@ func EnsureCodexAllowed(ctx context.Context, cfg *config.Config, req executor.Re
 		if decision.Reason != "" {
 			message = message + ": " + decision.Reason
 		}
-		recordCodexBlockedEvent(now, settings, sessionID, req, opts, input, decision, decisionSource, message)
+		if decisionSource == DecisionSourceFreshAudit {
+			recordCodexBlockedEvent(now, settings, sessionID, req, opts, input, decision, decisionSource, message)
+		}
 		status := settings.blockStatus
 		if status <= 0 {
 			status = defaultBlockStatus

@@ -138,7 +138,7 @@ func TestEnsureCodexAllowedBlocksPreBlockDecision(t *testing.T) {
 	}
 }
 
-func TestEnsureCodexAllowedLogsBlockedBanDecision(t *testing.T) {
+func TestEnsureCodexAllowedDoesNotLogBlockedBanDecision(t *testing.T) {
 	oldTracker := defaultTracker
 	defaultTracker = NewSessionTracker()
 	t.Cleanup(func() { defaultTracker = oldTracker })
@@ -146,7 +146,9 @@ func TestEnsureCodexAllowedLogsBlockedBanDecision(t *testing.T) {
 	defaultBlockedEventStore = NewBlockEventStore(16)
 	t.Cleanup(func() { defaultBlockedEventStore = oldBlockedStore })
 
+	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"privacy_abuse\",\"subcategory_code\":\"privacy_doxxing_or_sensitive_data_abuse\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"repeat blocked prompt\"],\"reason\":\"blocked by cache test\"}"}]}]}`))
 	}))
@@ -177,14 +179,14 @@ func TestEnsureCodexAllowedLogsBlockedBanDecision(t *testing.T) {
 	}
 
 	page := defaultBlockedEventStore.ListBlockedEvents(BlockEventListOptions{Limit: 10})
-	if page.Returned != 2 {
-		t.Fatalf("blocked event count = %d, want 2", page.Returned)
+	if page.Returned != 1 {
+		t.Fatalf("blocked event count = %d, want 1", page.Returned)
 	}
-	if page.Items[0].DecisionSource != DecisionSourceBlockedBan {
-		t.Fatalf("latest DecisionSource = %q, want %q", page.Items[0].DecisionSource, DecisionSourceBlockedBan)
+	if page.Items[0].DecisionSource != DecisionSourceFreshAudit {
+		t.Fatalf("DecisionSource = %q, want %q", page.Items[0].DecisionSource, DecisionSourceFreshAudit)
 	}
-	if page.Items[1].DecisionSource != DecisionSourceFreshAudit {
-		t.Fatalf("first DecisionSource = %q, want %q", page.Items[1].DecisionSource, DecisionSourceFreshAudit)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("audit calls = %d, want 1", got)
 	}
 }
 
