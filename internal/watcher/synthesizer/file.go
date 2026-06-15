@@ -184,6 +184,14 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
 	// For codex auth files, extract plan_type from the JWT id_token.
 	if provider == "codex" {
+		for _, key := range []string{"base_url", "base-url"} {
+			if rawBaseURL, ok := metadata[key].(string); ok {
+				if baseURL := strings.TrimSpace(rawBaseURL); baseURL != "" {
+					a.Attributes["base_url"] = baseURL
+					break
+				}
+			}
+		}
 		if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
 			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
 				if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {

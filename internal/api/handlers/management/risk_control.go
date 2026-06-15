@@ -13,30 +13,12 @@ import (
 
 // GetRiskControlBlocks lists persisted risk-control block events.
 func (h *Handler) GetRiskControlBlocks(c *gin.Context) {
-	store := h.riskBlockEvents()
-	if store == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "risk control block log unavailable"})
-		return
-	}
+	h.listRiskControlEvents(c, h.riskBlockEvents(), "risk control block log unavailable")
+}
 
-	limit, errLimit := parseLimit(c.Query("limit"))
-	if errLimit != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid limit: %v", errLimit)})
-		return
-	}
-
-	beforeID, errBeforeID := parseUintQuery(c.Query("before_id"))
-	if errBeforeID != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid before_id: %v", errBeforeID)})
-		return
-	}
-
-	page := store.ListBlockedEvents(riskcontrol.BlockEventListOptions{
-		SessionID: c.Query("session_id"),
-		BeforeID:  beforeID,
-		Limit:     limit,
-	})
-	c.JSON(http.StatusOK, page)
+// GetRiskControlObservations lists persisted observe-only audit events.
+func (h *Handler) GetRiskControlObservations(c *gin.Context) {
+	h.listRiskControlEvents(c, h.riskObserveEvents(), "risk control observe log unavailable")
 }
 
 // PostRiskControlAllowOnce creates an input-hash-based allow-once override and labels a should_allow sample.
@@ -101,16 +83,77 @@ func (h *Handler) PostRiskControlConfirmBlock(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"sample": sample})
 }
 
+// PostRiskControlObservationAllow labels an observe-only event as a should_allow sample.
+func (h *Handler) PostRiskControlObservationAllow(c *gin.Context) {
+	event, ok := h.lookupRiskControlObserveEvent(c)
+	if !ok {
+		return
+	}
+	sample, err := h.riskSamples().Append(riskcontrol.NewSampleRecordFromBlockEvent(event, riskcontrol.SampleShouldAllow, "observe_allow", time.Now().UTC()))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"sample": sample})
+}
+
+// PostRiskControlObservationBlock labels an observe-only event as a should_block sample.
+func (h *Handler) PostRiskControlObservationBlock(c *gin.Context) {
+	event, ok := h.lookupRiskControlObserveEvent(c)
+	if !ok {
+		return
+	}
+	sample, err := h.riskSamples().Append(riskcontrol.NewSampleRecordFromBlockEvent(event, riskcontrol.SampleShouldBlock, "observe_block", time.Now().UTC()))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"sample": sample})
+}
+
 // GetRiskControlPage serves a standalone management page for blocked-session inspection.
 func (h *Handler) GetRiskControlPage(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(riskControlPageHTML))
 }
 
-func (h *Handler) lookupRiskControlEvent(c *gin.Context) (riskcontrol.BlockEvent, bool) {
-	store := h.riskBlockEvents()
+func (h *Handler) listRiskControlEvents(c *gin.Context, store *riskcontrol.BlockEventStore, unavailableMessage string) {
 	if store == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "risk control block log unavailable"})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": unavailableMessage})
+		return
+	}
+
+	limit, errLimit := parseLimit(c.Query("limit"))
+	if errLimit != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid limit: %v", errLimit)})
+		return
+	}
+
+	beforeID, errBeforeID := parseUintQuery(c.Query("before_id"))
+	if errBeforeID != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid before_id: %v", errBeforeID)})
+		return
+	}
+
+	page := store.ListBlockedEvents(riskcontrol.BlockEventListOptions{
+		SessionID: c.Query("session_id"),
+		BeforeID:  beforeID,
+		Limit:     limit,
+	})
+	c.JSON(http.StatusOK, page)
+}
+
+func (h *Handler) lookupRiskControlEvent(c *gin.Context) (riskcontrol.BlockEvent, bool) {
+	return h.lookupRiskControlEventFromStore(c, h.riskBlockEvents(), "risk control block log unavailable", "block event not found")
+}
+
+func (h *Handler) lookupRiskControlObserveEvent(c *gin.Context) (riskcontrol.BlockEvent, bool) {
+	return h.lookupRiskControlEventFromStore(c, h.riskObserveEvents(), "risk control observe log unavailable", "observe event not found")
+}
+
+func (h *Handler) lookupRiskControlEventFromStore(c *gin.Context, store *riskcontrol.BlockEventStore, unavailableMessage string, notFoundMessage string) (riskcontrol.BlockEvent, bool) {
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": unavailableMessage})
 		return riskcontrol.BlockEvent{}, false
 	}
 	id, err := parseUintQuery(c.Param("id"))
@@ -120,7 +163,7 @@ func (h *Handler) lookupRiskControlEvent(c *gin.Context) (riskcontrol.BlockEvent
 	}
 	event, ok := store.GetBlockedEventByID(id)
 	if !ok {
-		c.JSON(http.StatusNotFound, gin.H{"error": "block event not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": notFoundMessage})
 		return riskcontrol.BlockEvent{}, false
 	}
 	return event, true
@@ -131,6 +174,13 @@ func (h *Handler) riskBlockEvents() *riskcontrol.BlockEventStore {
 		return h.riskBlockStore
 	}
 	return riskcontrol.DefaultBlockedEventStore()
+}
+
+func (h *Handler) riskObserveEvents() *riskcontrol.BlockEventStore {
+	if h != nil && h.riskObserveStore != nil {
+		return h.riskObserveStore
+	}
+	return riskcontrol.DefaultObserveEventStore()
 }
 
 func (h *Handler) riskOverrides() *riskcontrol.OverrideStore {
@@ -221,6 +271,19 @@ const riskControlPageHTML = `<!DOCTYPE html>
       padding: 16px;
       margin: 18px 0;
     }
+    .tabs {
+      display: flex;
+      gap: 10px;
+      margin: 0 0 14px;
+    }
+    .tab-button {
+      min-width: 120px;
+    }
+    .tab-button.active {
+      border-color: rgba(88,166,255,0.8);
+      background: rgba(88,166,255,0.2);
+      color: var(--text);
+    }
     .field {
       display: flex;
       flex-direction: column;
@@ -246,6 +309,7 @@ const riskControlPageHTML = `<!DOCTYPE html>
     button.warn { background: rgba(255,123,114,0.14); }
     button.ok { background: rgba(63,185,80,0.16); }
     button:disabled { opacity: 0.45; cursor: default; }
+    .hidden { display: none !important; }
     .layout {
       display: grid;
       grid-template-columns: minmax(0, 1.5fr) minmax(340px, 0.95fr);
@@ -383,10 +447,15 @@ const riskControlPageHTML = `<!DOCTYPE html>
 
     <div class="status" id="status" role="status" aria-live="polite"></div>
 
+    <div class="tabs" role="tablist" aria-label="Risk control event type">
+      <button id="blockedTabBtn" class="tab-button active" role="tab" aria-selected="true">Blocked</button>
+      <button id="observeTabBtn" class="tab-button" role="tab" aria-selected="false">Observe</button>
+    </div>
+
     <section class="layout">
       <section class="panel">
         <div class="panel-header">
-          <div>Recent blocked events</div>
+          <div id="tableTitle">Recent blocked events</div>
           <div class="subtle" id="countLabel">0 rows</div>
         </div>
         <div class="table-wrap">
@@ -394,7 +463,7 @@ const riskControlPageHTML = `<!DOCTYPE html>
             <thead>
               <tr>
                 <th>ID</th>
-                <th>Blocked At</th>
+                <th id="timeHeader">Blocked At</th>
                 <th>Session</th>
                 <th>Policy</th>
                 <th>Confidence</th>
@@ -442,6 +511,8 @@ const riskControlPageHTML = `<!DOCTYPE html>
             <button id="allowOnceBtn" class="ok" disabled>Allow once</button>
             <button id="allowSessionBtn" class="primary" disabled>Allow session</button>
             <button id="confirmBlockBtn" class="warn" disabled>Confirm block</button>
+            <button id="observeAllowBtn" class="ok hidden" disabled>ALLOW</button>
+            <button id="observeBlockBtn" class="warn hidden" disabled>BLOCK</button>
           </div>
         </div>
       </aside>
@@ -468,8 +539,15 @@ const riskControlPageHTML = `<!DOCTYPE html>
     var allowOnceBtn = document.getElementById('allowOnceBtn');
     var allowSessionBtn = document.getElementById('allowSessionBtn');
     var confirmBlockBtn = document.getElementById('confirmBlockBtn');
+    var observeAllowBtn = document.getElementById('observeAllowBtn');
+    var observeBlockBtn = document.getElementById('observeBlockBtn');
     var loadOlderBtn = document.getElementById('loadOlderBtn');
+    var blockedTabBtn = document.getElementById('blockedTabBtn');
+    var observeTabBtn = document.getElementById('observeTabBtn');
+    var tableTitleEl = document.getElementById('tableTitle');
+    var timeHeaderEl = document.getElementById('timeHeader');
 
+    var activeView = 'blocks';
     var selected = null;
     var nextBeforeID = 0;
     var hasMore = false;
@@ -506,7 +584,7 @@ const riskControlPageHTML = `<!DOCTYPE html>
           var selectedClass = selected && selected.id === item.id ? ' class="selected"' : '';
           return '<tr data-id="' + item.id + '"' + selectedClass + '>' +
             '<td>' + item.id + '</td>' +
-            '<td>' + escapeHTML(item.blocked_at || '') + '</td>' +
+            '<td>' + escapeHTML(item.observed_at || item.blocked_at || '') + '</td>' +
             '<td>' + escapeHTML(item.session_id || '') + '</td>' +
             '<td>' + escapeHTML(item.policy_code || '-') + '</td>' +
             '<td>' + escapeHTML(formatConfidence(item.confidence)) + '</td>' +
@@ -530,9 +608,17 @@ const riskControlPageHTML = `<!DOCTYPE html>
       detailEvidenceEl.textContent = item && item.evidence && item.evidence.length ? item.evidence.join('\n') : '-';
       detailInputEl.textContent = item ? (item.user_text_preview || '-') : '-';
       detailRawEl.textContent = item ? (item.raw_audit_response || '-') : '-';
-      allowOnceBtn.disabled = !item || !item.input_hash;
-      allowSessionBtn.disabled = !item || !item.session_id;
-      confirmBlockBtn.disabled = !item;
+      var isObserve = activeView === 'observe';
+      allowOnceBtn.classList.toggle('hidden', isObserve);
+      allowSessionBtn.classList.toggle('hidden', isObserve);
+      confirmBlockBtn.classList.toggle('hidden', isObserve);
+      observeAllowBtn.classList.toggle('hidden', !isObserve);
+      observeBlockBtn.classList.toggle('hidden', !isObserve);
+      allowOnceBtn.disabled = isObserve || !item || !item.input_hash;
+      allowSessionBtn.disabled = isObserve || !item || !item.session_id;
+      confirmBlockBtn.disabled = isObserve || !item;
+      observeAllowBtn.disabled = !isObserve || !item;
+      observeBlockBtn.disabled = !isObserve || !item;
       renderRows();
     }
 
@@ -559,8 +645,9 @@ const riskControlPageHTML = `<!DOCTYPE html>
       params.set('limit', String(limit));
       if (append && nextBeforeID) params.set('before_id', String(nextBeforeID));
 
-      setStatus('Loading...', 'pending');
-      var resp = await fetch('/v0/management/risk-control/blocks?' + params.toString(), { headers: headers() });
+      var endpoint = activeView === 'observe' ? '/v0/management/risk-control/observations' : '/v0/management/risk-control/blocks';
+      setStatus('Loading ' + activeView + ' events...', 'pending');
+      var resp = await fetch(endpoint + '?' + params.toString(), { headers: headers() });
       var payload = await readResponsePayload(resp);
       if (!resp.ok) {
         throw new Error(responseErrorMessage(resp, payload));
@@ -576,6 +663,23 @@ const riskControlPageHTML = `<!DOCTYPE html>
       }
       renderDetail();
       setStatus('Loaded ' + (payload.returned || 0) + ' rows.');
+    }
+
+    function switchView(view) {
+      activeView = view;
+      selected = null;
+      nextBeforeID = 0;
+      hasMore = false;
+      items = [];
+      blockedTabBtn.classList.toggle('active', view === 'blocks');
+      observeTabBtn.classList.toggle('active', view === 'observe');
+      blockedTabBtn.setAttribute('aria-selected', view === 'blocks' ? 'true' : 'false');
+      observeTabBtn.setAttribute('aria-selected', view === 'observe' ? 'true' : 'false');
+      tableTitleEl.textContent = view === 'observe' ? 'Observe-only audit events' : 'Recent blocked events';
+      timeHeaderEl.textContent = view === 'observe' ? 'Observed At' : 'Blocked At';
+      rowsEl.innerHTML = '<tr><td colspan="6" class="subtle">No data loaded yet.</td></tr>';
+      renderDetail();
+      loadBlocks(false).catch(function(err) { setStatus(err.message, true); });
     }
 
     async function readResponsePayload(resp) {
@@ -601,6 +705,8 @@ const riskControlPageHTML = `<!DOCTYPE html>
       allowOnceBtn.disabled = true;
       allowSessionBtn.disabled = true;
       confirmBlockBtn.disabled = true;
+      observeAllowBtn.disabled = true;
+      observeBlockBtn.disabled = true;
       if (!isBusy) {
         renderDetail();
       }
@@ -660,6 +766,22 @@ const riskControlPageHTML = `<!DOCTYPE html>
 
     confirmBlockBtn.addEventListener('click', function() {
       postAction('/v0/management/risk-control/blocks/' + selected.id + '/confirm-block', 'Confirm block succeeded; API call completed.');
+    });
+
+    observeAllowBtn.addEventListener('click', function() {
+      postAction('/v0/management/risk-control/observations/' + selected.id + '/allow', 'Observe ALLOW label saved; sample added.');
+    });
+
+    observeBlockBtn.addEventListener('click', function() {
+      postAction('/v0/management/risk-control/observations/' + selected.id + '/block', 'Observe BLOCK label saved; sample added.');
+    });
+
+    blockedTabBtn.addEventListener('click', function() {
+      if (activeView !== 'blocks') switchView('blocks');
+    });
+
+    observeTabBtn.addEventListener('click', function() {
+      if (activeView !== 'observe') switchView('observe');
     });
 
     window.addEventListener('load', function() {

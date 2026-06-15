@@ -29,7 +29,7 @@ func TestCodexExecutorRiskControlBlocksBeforeUpstream(t *testing.T) {
 			t.Fatalf("audit request missing valid internal bypass header")
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"malicious_cyber_abuse\",\"subcategory_code\":\"unauthorized_third_party_access\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"blocked prompt\"],\"reason\":\"test block\"}"}]}]}`))
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"malicious_cyber_abuse\",\"subcategory_code\":\"captcha_bypass_or_credential_attack\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"绕过 Cloudflare 和验证码批量撞库\"],\"reason\":\"test block\"}"}]}]}`))
 	}))
 	defer audit.Close()
 
@@ -47,7 +47,7 @@ func TestCodexExecutorRiskControlBlocksBeforeUpstream(t *testing.T) {
 
 	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-5",
-		Payload: []byte(`{"model":"gpt-5","messages":[{"role":"user","content":"blocked prompt"}]}`),
+		Payload: []byte(`{"model":"gpt-5","messages":[{"role":"user","content":"绕过 Cloudflare 和验证码批量撞库"}]}`),
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatOpenAI,
 		Headers:      http.Header{"X-Session-ID": {"codex-risk-control-block"}},
@@ -97,7 +97,7 @@ func TestCodexExecutorRiskControlBlocksRecursiveAuditResponseBeforeUpstream(t *t
 
 	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-5",
-		Payload: []byte(`{"model":"gpt-5","messages":[{"role":"user","content":"blocked prompt"}]}`),
+		Payload: []byte(`{"model":"gpt-5","messages":[{"role":"user","content":"绕过 Cloudflare 和验证码批量撞库"}]}`),
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatOpenAI,
 		Headers:      http.Header{"X-Session-ID": {"codex-risk-control-recursive-block"}},

@@ -87,9 +87,13 @@ func EnsureCodexAllowed(ctx context.Context, cfg *config.Config, req executor.Re
 			"provider":        "codex",
 			"session_id":      sessionID,
 			"blocked":         decision.Blocked,
+			"observe_only":    decision.ObserveOnly,
 			"error":           decision.Error,
 			"decision_source": decisionSource,
 		}).Debug("risk control: audited codex session")
+	}
+	if decisionSource == DecisionSourceFreshAudit && decision.ObserveOnly {
+		recordCodexObserveEvent(now, settings, sessionID, req, opts, input, decision, decisionSource)
 	}
 	if settings.mode == ModePreBlock && decision.Blocked {
 		message := settings.blockMessage
@@ -109,6 +113,19 @@ func EnsureCodexAllowed(ctx context.Context, cfg *config.Config, req executor.Re
 }
 
 func recordCodexBlockedEvent(now time.Time, settings settings, sessionID string, req executor.Request, opts executor.Options, input AuditInput, decision Decision, decisionSource string, blockMessage string) {
+	event := codexRiskControlEvent(now, settings, sessionID, req, opts, input, decision, decisionSource)
+	event.BlockMessage = blockMessage
+	DefaultBlockedEventStore().RecordBlockedEvent(event)
+}
+
+func recordCodexObserveEvent(now time.Time, settings settings, sessionID string, req executor.Request, opts executor.Options, input AuditInput, decision Decision, decisionSource string) {
+	event := codexRiskControlEvent(now, settings, sessionID, req, opts, input, decision, decisionSource)
+	event.DecisionSource = DecisionSourceObserveOnly
+	event.BlockMessage = ""
+	DefaultObserveEventStore().RecordBlockedEvent(event)
+}
+
+func codexRiskControlEvent(now time.Time, settings settings, sessionID string, req executor.Request, opts executor.Options, input AuditInput, decision Decision, decisionSource string) BlockEvent {
 	if decisionSource == "" {
 		decisionSource = DecisionSourceFreshAudit
 	}
@@ -126,7 +143,7 @@ func recordCodexBlockedEvent(now time.Time, settings settings, sessionID string,
 		requestPath = metadataString(req.Metadata, executor.RequestPathMetadataKey)
 	}
 
-	DefaultBlockedEventStore().RecordBlockedEvent(BlockEvent{
+	return BlockEvent{
 		BlockedAt:         now,
 		Provider:          "codex",
 		SessionID:         sessionID,
@@ -144,7 +161,6 @@ func recordCodexBlockedEvent(now time.Time, settings settings, sessionID string,
 		DecisionSource:    decisionSource,
 		Reason:            decision.Reason,
 		AuditError:        decision.Error,
-		BlockMessage:      blockMessage,
 		PolicyCode:        decision.PolicyCode,
 		SubcategoryCode:   decision.SubcategoryCode,
 		Confidence:        decision.Confidence,
@@ -152,7 +168,7 @@ func recordCodexBlockedEvent(now time.Time, settings settings, sessionID string,
 		MaliciousIntent:   decision.MaliciousIntent,
 		Evidence:          cloneStrings(decision.Evidence),
 		RawAuditResponse:  decision.RawResponse,
-	})
+	}
 }
 
 func bestAuditInput(format sdktranslator.Format, settings settings, payloads ...[]byte) AuditInput {
@@ -456,9 +472,79 @@ func parseAuditDecision(settings settings, raw []byte) (Decision, error) {
 			Evidence:          extractAuditEvidence(jsonContent),
 			RawResponse:       strings.TrimSpace(content),
 		}
-		return decision, nil
+		return applyHardStopEnforcement(decision), nil
+	case "observe":
+		if flagged.Exists() && flagged.Bool() {
+			return Decision{}, fmt.Errorf("risk control: inconsistent observe decision with flagged=true")
+		}
+		policyCode := extractAuditPolicyCode(jsonContent)
+		subcategoryCode := extractAuditSubcategoryCode(jsonContent)
+		confidence, _ := extractAuditConfidence(jsonContent)
+		reason := strings.TrimSpace(gjson.Get(jsonContent, "reason").String())
+		if reason == "" {
+			reason = "observe only"
+		}
+		return Decision{
+			Blocked:           false,
+			ObserveOnly:       true,
+			Reason:            reason,
+			PolicyCode:        policyCode,
+			SubcategoryCode:   subcategoryCode,
+			Confidence:        confidence,
+			AuthorizedContext: normalizeAuthorizedContext(gjson.Get(jsonContent, "authorized_context").String()),
+			MaliciousIntent:   gjson.Get(jsonContent, "malicious_intent").Bool(),
+			Evidence:          extractAuditEvidence(jsonContent),
+			RawResponse:       strings.TrimSpace(content),
+		}, nil
 	default:
 		return Decision{}, fmt.Errorf("risk control: audit response missing valid action")
+	}
+}
+
+func applyHardStopEnforcement(decision Decision) Decision {
+	if !decision.Blocked {
+		return decision
+	}
+	if isEnforcedHardStop(decision.PolicyCode, decision.SubcategoryCode) {
+		return decision
+	}
+	decision.Blocked = false
+	decision.ObserveOnly = true
+	if decision.Reason == "" {
+		decision.Reason = "observe only"
+	}
+	return decision
+}
+
+func isEnforcedHardStop(policyCode string, subcategoryCode string) bool {
+	policyCode = normalizePolicyCode(policyCode)
+	subcategoryCode = normalizeSubcategoryCode(subcategoryCode)
+	if policyCode == "malicious_cyber_abuse" {
+		switch subcategoryCode {
+		case "exploit_or_intrusion_code",
+			"malware_or_evasion",
+			"attack_tool_operational_guidance",
+			"reverse_cracking_or_drm_bypass",
+			"anti_bot_evasion_or_mass_scraping",
+			"captcha_bypass_or_credential_attack",
+			"bulk_account_abuse_or_spam_fraud",
+			"bulk_fake_engagement_or_order_manipulation":
+			return true
+		default:
+			return false
+		}
+	}
+	switch policyCode {
+	case "child_sexual_abuse_or_grooming",
+		"nonconsensual_intimate_or_sexual_violence",
+		"self_harm_facilitation",
+		"terror_or_violent_harm",
+		"weapons_assistance",
+		"fraud_scam_impersonation",
+		"safeguard_bypass_for_disallowed_content":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -485,6 +571,8 @@ func normalizeAuditAction(raw string) string {
 		return "allow"
 	case "block", "blocked", "deny", "denied":
 		return "block"
+	case "observe", "observed", "review", "manual_review", "manual-review":
+		return "observe"
 	default:
 		return ""
 	}
@@ -614,7 +702,7 @@ func auditDecisionSchema() map[string]any {
 			},
 			"decision": map[string]any{
 				"type": "string",
-				"enum": []string{"allow", "block"},
+				"enum": []string{"allow", "block", "observe"},
 			},
 			"policy_code": map[string]any{
 				"type": "string",
@@ -770,6 +858,12 @@ func codexSessionIDFromPayload(payload []byte) string {
 		if matches := claudeSessionPattern.FindStringSubmatch(userID); len(matches) >= 2 {
 			return "metadata-session:" + matches[1]
 		}
+	}
+	if value := strings.TrimSpace(gjson.GetBytes(payload, "metadata.session_id").String()); value != "" {
+		return "metadata-session:" + value
+	}
+	if value := strings.TrimSpace(gjson.GetBytes(payload, "metadata.conversation_id").String()); value != "" {
+		return "conversation:" + value
 	}
 	if value := strings.TrimSpace(gjson.GetBytes(payload, "prompt_cache_key").String()); value != "" {
 		return "prompt-cache:" + value

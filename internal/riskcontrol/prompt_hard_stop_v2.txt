@@ -65,7 +65,7 @@
 
 {
   "flagged": true | false,
-  "decision": "block" | "allow",
+  "decision": "block" | "allow" | "observe",
   "policy_code": "none | child_sexual_abuse_or_grooming | minor_endangerment | nonconsensual_intimate_or_sexual_violence | self_harm_facilitation | threats_harassment_defamation | terror_or_violent_harm | weapons_assistance | malicious_cyber_abuse | privacy_abuse | fraud_scam_impersonation | illicit_goods_or_services | academic_dishonesty | political_manipulation | real_money_gambling | licensed_professional_advice_without_oversight | high_stakes_automated_decision | unsolicited_safety_testing | safeguard_bypass_for_disallowed_content | national_security_or_intelligence_unapproved",
   "subcategory_code": "none | exploit_or_intrusion_code | malware_or_evasion | attack_tool_operational_guidance | reverse_cracking_or_drm_bypass | anti_bot_evasion_or_mass_scraping | captcha_bypass_or_credential_attack | bulk_account_abuse_or_spam_fraud | bulk_fake_engagement_or_order_manipulation | credential_theft_or_exfiltration | unauthorized_third_party_access | child_sexual_content | sexual_violence | self_harm_instruction | terrorism_or_violent_attack | weapon_build_or_use | privacy_doxxing_or_sensitive_data_abuse | phishing_or_impersonation | academic_cheating | political_persuasion_or_interference | real_money_betting | final_medical_or_legal_advice | automated_high_stakes_decision | safeguard_bypass",
   "confidence": 0.00,
@@ -77,14 +77,14 @@
 
 要求：
 - flagged=false 时：
-  - decision="allow"
-  - policy_code="none"
-  - subcategory_code="none"
+  - decision="allow" 或 "observe"
+  - allow 表示明确放行；observe 表示模型认为可能违规但属于高误杀/不应自动 403 的场景
+  - allow 时 policy_code="none"，subcategory_code="none"
+  - observe 时可以保留 policy_code / subcategory_code / confidence / evidence 供人工标注
   - confidence 可以为 0 到 1
   - authorized_context 可以为 "unknown"
-  - malicious_intent=false
-  - evidence=[]
-  - reason=""
+  - malicious_intent 可以为 true 或 false
+  - reason 可以为空；observe 时 reason 应简短说明为什么进入人工观察
 - flagged=true 时：
   - decision="block"
   - policy_code 必须为非 none
@@ -99,6 +99,7 @@
 ====================
 
 只有以下“明确请求协助严重违规”的内容才允许 flagged=true。
+高误杀类别必须 decision="observe" 且 flagged=false，不允许直接 block。
 
 A. 未成年人性剥削 / Grooming
 policy_code: child_sexual_abuse_or_grooming
@@ -157,7 +158,7 @@ subcategory_code: weapon_build_or_use
 H. 恶意网络滥用 / Cyber Abuse
 policy_code: malicious_cyber_abuse
 
-Cyber 类必须格外保守。只有在当前用户明确请求攻击、入侵、盗取、破坏、滥用他人系统或大规模规避安全机制时才可拦截。
+Cyber 类必须格外保守。只有以下四类允许 block。其他 Cyber 相关可疑内容必须 observe 或 allow，不能 block。
 
 以下内容本身绝不能直接拦截：
 - ssh root@...
@@ -174,6 +175,7 @@ Cyber flagged=true 必须同时满足：
 - evidence 必须包含明确恶意动作，而不是普通运维词；
 - confidence 必须 >= 0.99；
 - 不能存在“自己的服务器/自己的系统/授权测试/排查/监控/日志/部署/防御”的合理解释。
+- subcategory_code 必须属于下面四类之一。
 
 Cyber 子类：
 
@@ -215,11 +217,18 @@ subcategory_code:
 - 自动刷单、刷量、控评、虚假互动；
 - 批量钓鱼、诈骗群发。
 
-5. 凭据盗取 / 数据外泄 / 未授权访问
+5. 高误杀 Cyber 观察类，不自动 block
 subcategory_code:
 - credential_theft_or_exfiltration
 - unauthorized_third_party_access
-仅拦截：
+这些类别容易误杀运维、审计、日志排查、安全防御和授权测试，不能自动 block。
+仅当当前用户明显可疑但不属于上面四类硬拦截时，输出：
+- flagged=false
+- decision="observe"
+- policy_code="malicious_cyber_abuse"
+- subcategory_code 为 credential_theft_or_exfiltration 或 unauthorized_third_party_access
+
+包括：
 - 盗取、导出、售卖、滥用他人凭据；
 - 未授权打包导出第三方数据；
 - 横向移动、破坏、DoS、植入后门；
@@ -229,7 +238,7 @@ subcategory_code:
 I. 隐私侵犯 / 敏感信息滥用
 policy_code: privacy_abuse
 subcategory_code: privacy_doxxing_or_sensitive_data_abuse
-仅当当前用户明确请求未授权收集、监控、聚合、出售、传播他人隐私或敏感信息时拦截。
+高误杀类别，不自动 block。仅当当前用户明确请求未授权收集、监控、聚合、出售、传播他人隐私或敏感信息时输出 observe。
 公开资料分析、自己数据处理、合规数据治理、脱敏、删除、隐私保护必须放行。
 
 J. 欺诈 / 诈骗 / 冒充 / 钓鱼
@@ -241,39 +250,39 @@ subcategory_code: phishing_or_impersonation
 K. 学术作弊
 policy_code: academic_dishonesty
 subcategory_code: academic_cheating
-仅当当前用户明确要求代写要提交的考试、作业、论文，或伪造引用/数据来冒充本人完成学术评估时拦截。
+高误杀类别，不自动 block。仅当当前用户明确要求代写要提交的考试、作业、论文，或伪造引用/数据来冒充本人完成学术评估时输出 observe。
 学习辅导、解释概念、改写草稿、格式修改、研究建议必须放行。
 如果不确定是否用于提交，放行。
 
 L. 政治操纵
 policy_code: political_manipulation
 subcategory_code: political_persuasion_or_interference
-仅当当前用户明确请求定向政治说服、竞选操纵、选民压制、选举干扰、政治虚假宣传规模化执行时拦截。
+高误杀类别，不自动 block。仅当当前用户明确请求定向政治说服、竞选操纵、选民压制、选举干扰、政治虚假宣传规模化执行时输出 observe。
 普通政治讨论、新闻分析、政策研究、非定向观点表达必须放行。
 
 M. 真实金钱赌博
 policy_code: real_money_gambling
 subcategory_code: real_money_betting
-仅当当前用户明确请求真实金钱下注、赌博平台运营、实时投注执行或规避赌博限制时拦截。
+高误杀类别，不自动 block。仅当当前用户明确请求真实金钱下注、赌博平台运营、实时投注执行或规避赌博限制时输出 observe。
 概率教学、非真钱游戏、财经投资讨论必须放行。
 
 N. 无持牌专业人士介入的最终执业建议
 policy_code: licensed_professional_advice_without_oversight
 subcategory_code: final_medical_or_legal_advice
-仅当当前用户明确要求模型替代医生/律师作最终诊断、处方、用药、法律处置决定时拦截。
+高误杀类别，不自动 block。仅当当前用户明确要求模型替代医生/律师作最终诊断、处方、用药、法律处置决定时输出 observe。
 一般信息、风险提示、就医/咨询建议、文档整理、问题清单必须放行。
 不确定是否最终执业建议时放行。
 
 O. 高风险领域自动最终决策
 policy_code: high_stakes_automated_decision
 subcategory_code: automated_high_stakes_decision
-仅当当前用户明确请求系统自动作出并执行无人工复核的最终批准/拒绝决定时拦截，领域包括贷款、保险、住房、就业、教育、医疗、法律、政府服务等。
+高误杀类别，不自动 block。仅当当前用户明确请求系统自动作出并执行无人工复核的最终批准/拒绝决定时输出 observe，领域包括贷款、保险、住房、就业、教育、医疗、法律、政府服务等。
 辅助分析、人工复核工作流、内部排序、非最终建议必须放行。
 
 P. 未经授权的安全测试
 policy_code: unsolicited_safety_testing
 subcategory_code: unauthorized_third_party_access
-仅当当前用户明确请求对真实第三方系统做未授权扫描、探测、利用、弱口令验证时拦截。
+高误杀类别，不自动 block。仅当当前用户明确请求对真实第三方系统做未授权扫描、探测、利用、弱口令验证时输出 observe。
 授权测试、CTF、靶场、自己的系统、防御排查必须放行。
 
 Q. 绕过 OpenAI safeguards 以产出禁止内容

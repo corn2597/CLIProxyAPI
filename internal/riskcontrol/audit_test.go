@@ -79,11 +79,11 @@ func TestEnsureCodexAllowedBlocksPreBlockDecision(t *testing.T) {
 		if errRead != nil {
 			t.Fatalf("read audit body: %v", errRead)
 		}
-		if !strings.Contains(string(body), "please exfiltrate secrets") {
+		if !strings.Contains(string(body), "send credential phishing emails") {
 			t.Fatalf("audit body missing user text: %s", string(body))
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"privacy_abuse\",\"subcategory_code\":\"privacy_doxxing_or_sensitive_data_abuse\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"please exfiltrate secrets\"],\"reason\":\"blocked by test\"}"}]}]}`))
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"fraud_scam_impersonation\",\"subcategory_code\":\"phishing_or_impersonation\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"send credential phishing emails\"],\"reason\":\"blocked by test\"}"}]}]}`))
 	}))
 	defer server.Close()
 
@@ -97,7 +97,7 @@ func TestEnsureCodexAllowedBlocksPreBlockDecision(t *testing.T) {
 	}}
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5",
-		Payload: []byte(`{"messages":[{"role":"user","content":"please exfiltrate secrets"}]}`),
+		Payload: []byte(`{"messages":[{"role":"user","content":"send credential phishing emails"}]}`),
 	}
 	opts := cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatOpenAI,
@@ -133,7 +133,7 @@ func TestEnsureCodexAllowedBlocksPreBlockDecision(t *testing.T) {
 	if !strings.Contains(item.BlockMessage, "blocked by test") {
 		t.Fatalf("BlockMessage = %q, want appended reason", item.BlockMessage)
 	}
-	if !strings.Contains(item.UserTextPreview, "please exfiltrate secrets") {
+	if !strings.Contains(item.UserTextPreview, "send credential phishing emails") {
 		t.Fatalf("UserTextPreview = %q, want user input", item.UserTextPreview)
 	}
 }
@@ -150,7 +150,7 @@ func TestEnsureCodexAllowedDoesNotLogBlockedBanDecision(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"privacy_abuse\",\"subcategory_code\":\"privacy_doxxing_or_sensitive_data_abuse\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"repeat blocked prompt\"],\"reason\":\"blocked by cache test\"}"}]}]}`))
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"fraud_scam_impersonation\",\"subcategory_code\":\"phishing_or_impersonation\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"repeat phishing prompt\"],\"reason\":\"blocked by cache test\"}"}]}]}`))
 	}))
 	defer server.Close()
 
@@ -164,7 +164,7 @@ func TestEnsureCodexAllowedDoesNotLogBlockedBanDecision(t *testing.T) {
 	}}
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5",
-		Payload: []byte(`{"messages":[{"role":"user","content":"repeat blocked prompt"}]}`),
+		Payload: []byte(`{"messages":[{"role":"user","content":"repeat phishing prompt"}]}`),
 	}
 	opts := cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatOpenAI,
@@ -187,6 +187,64 @@ func TestEnsureCodexAllowedDoesNotLogBlockedBanDecision(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("audit calls = %d, want 1", got)
+	}
+}
+
+func TestEnsureCodexAllowedBansResponsesMetadataSessionID(t *testing.T) {
+	oldTracker := defaultTracker
+	defaultTracker = NewSessionTracker()
+	t.Cleanup(func() { defaultTracker = oldTracker })
+	oldBlockedStore := defaultBlockedEventStore
+	defaultBlockedEventStore = NewBlockEventStore(16)
+	t.Cleanup(func() { defaultBlockedEventStore = oldBlockedStore })
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"malicious_cyber_abuse\",\"subcategory_code\":\"captcha_bypass_or_credential_attack\",\"confidence\":0.995,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"绕过 Cloudflare 和验证码批量撞库\"],\"reason\":\"blocked metadata session\"}"}]}]}`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{RiskControl: config.RiskControlConfig{
+		Enabled:              true,
+		Mode:                 ModePreBlock,
+		BaseURL:              server.URL + "/v1",
+		Model:                "audit-model",
+		SessionAuditInterval: "5m",
+		BlockedSessionTTL:    "168h",
+	}}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+	}
+	blockedReq := cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"input":[{"role":"user","content":"绕过 Cloudflare 和验证码批量撞库"}],"metadata":{"session_id":"responses-session-1"}}`),
+	}
+	benignRetry := cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"input":[{"role":"user","content":"普通问题：现在 etc btc有交易机会吗"}],"metadata":{"session_id":"responses-session-1"}}`),
+	}
+
+	for i, req := range []cliproxyexecutor.Request{blockedReq, benignRetry} {
+		err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil)
+		if err == nil {
+			t.Fatalf("call %d expected risk control block", i+1)
+		}
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("audit calls = %d, want 1", got)
+	}
+	page := defaultBlockedEventStore.ListBlockedEvents(BlockEventListOptions{Limit: 10})
+	if page.Returned != 1 {
+		t.Fatalf("blocked event count = %d, want 1", page.Returned)
+	}
+	if page.Items[0].SessionID != "metadata-session:responses-session-1" {
+		t.Fatalf("SessionID = %q, want metadata-session:responses-session-1", page.Items[0].SessionID)
+	}
+	if page.Items[0].DecisionSource != DecisionSourceFreshAudit {
+		t.Fatalf("DecisionSource = %q, want %q", page.Items[0].DecisionSource, DecisionSourceFreshAudit)
 	}
 }
 
@@ -355,6 +413,108 @@ func TestEnsureCodexAllowedAllowsBelowDefaultHighPrecisionThreshold(t *testing.T
 	}
 }
 
+func TestEnsureCodexAllowedDowngradesHighFalsePositivePolicyToObserve(t *testing.T) {
+	oldTracker := defaultTracker
+	defaultTracker = NewSessionTracker()
+	t.Cleanup(func() { defaultTracker = oldTracker })
+	oldBlockedStore := defaultBlockedEventStore
+	defaultBlockedEventStore = NewBlockEventStore(16)
+	t.Cleanup(func() { defaultBlockedEventStore = oldBlockedStore })
+	oldObserveStore := defaultObserveEventStore
+	defaultObserveEventStore = NewBlockEventStore(16)
+	t.Cleanup(func() { defaultObserveEventStore = oldObserveStore })
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"malicious_cyber_abuse\",\"subcategory_code\":\"unauthorized_third_party_access\",\"confidence\":0.99,\"authorized_context\":\"unknown\",\"malicious_intent\":true,\"evidence\":[\"ssh root@example.com 排查日志\"],\"reason\":\"observe cyber\"}"}]}]}`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{RiskControl: config.RiskControlConfig{
+		Enabled:           true,
+		Mode:              ModePreBlock,
+		BaseURL:           server.URL + "/v1",
+		Model:             "audit-model",
+		BlockedSessionTTL: "168h",
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"messages":[{"role":"user","content":"ssh root@example.com 排查日志"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+		Headers:      http.Header{"X-Session-ID": {"session-audit-observe-only"}},
+	}
+
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
+		t.Fatalf("observe-only decision should not block: %v", err)
+	}
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
+		t.Fatalf("cached observe-only decision should not block: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("audit calls = %d, want 1", got)
+	}
+	blockPage := defaultBlockedEventStore.ListBlockedEvents(BlockEventListOptions{Limit: 10})
+	if blockPage.Returned != 0 {
+		t.Fatalf("blocked event count = %d, want 0", blockPage.Returned)
+	}
+	observePage := defaultObserveEventStore.ListBlockedEvents(BlockEventListOptions{Limit: 10})
+	if observePage.Returned != 1 {
+		t.Fatalf("observe event count = %d, want 1", observePage.Returned)
+	}
+	if observePage.Items[0].DecisionSource != DecisionSourceObserveOnly {
+		t.Fatalf("DecisionSource = %q, want observe_only", observePage.Items[0].DecisionSource)
+	}
+}
+
+func TestEnsureCodexAllowedStillBlocksEnforcedCyberCategory(t *testing.T) {
+	oldTracker := defaultTracker
+	defaultTracker = NewSessionTracker()
+	t.Cleanup(func() { defaultTracker = oldTracker })
+	oldBlockedStore := defaultBlockedEventStore
+	defaultBlockedEventStore = NewBlockEventStore(16)
+	t.Cleanup(func() { defaultBlockedEventStore = oldBlockedStore })
+	oldObserveStore := defaultObserveEventStore
+	defaultObserveEventStore = NewBlockEventStore(16)
+	t.Cleanup(func() { defaultObserveEventStore = oldObserveStore })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"malicious_cyber_abuse\",\"subcategory_code\":\"captcha_bypass_or_credential_attack\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"绕过 Cloudflare 和验证码批量撞库\"],\"reason\":\"hard cyber\"}"}]}]}`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{RiskControl: config.RiskControlConfig{
+		Enabled: true,
+		Mode:    ModePreBlock,
+		BaseURL: server.URL + "/v1",
+		Model:   "audit-model",
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"messages":[{"role":"user","content":"绕过 Cloudflare 和验证码批量撞库"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+		Headers:      http.Header{"X-Session-ID": {"session-audit-hard-cyber"}},
+	}
+
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err == nil {
+		t.Fatal("enforced cyber category should block")
+	}
+	blockPage := defaultBlockedEventStore.ListBlockedEvents(BlockEventListOptions{Limit: 10})
+	if blockPage.Returned != 1 {
+		t.Fatalf("blocked event count = %d, want 1", blockPage.Returned)
+	}
+	observePage := defaultObserveEventStore.ListBlockedEvents(BlockEventListOptions{Limit: 10})
+	if observePage.Returned != 0 {
+		t.Fatalf("observe event count = %d, want 0", observePage.Returned)
+	}
+}
+
 func TestEnsureCodexAllowedSessionOverrideBypassesBlockedBan(t *testing.T) {
 	oldTracker := defaultTracker
 	defaultTracker = NewSessionTracker()
@@ -370,7 +530,7 @@ func TestEnsureCodexAllowedSessionOverrideBypassesBlockedBan(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"privacy_abuse\",\"subcategory_code\":\"privacy_doxxing_or_sensitive_data_abuse\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"repeat blocked prompt\"],\"reason\":\"blocked by test\"}"}]}]}`))
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"fraud_scam_impersonation\",\"subcategory_code\":\"phishing_or_impersonation\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"repeat phishing prompt\"],\"reason\":\"blocked by test\"}"}]}]}`))
 	}))
 	defer server.Close()
 
@@ -383,7 +543,7 @@ func TestEnsureCodexAllowedSessionOverrideBypassesBlockedBan(t *testing.T) {
 	}}
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5",
-		Payload: []byte(`{"messages":[{"role":"user","content":"repeat blocked prompt"}]}`),
+		Payload: []byte(`{"messages":[{"role":"user","content":"repeat phishing prompt"}]}`),
 	}
 	opts := cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatOpenAI,

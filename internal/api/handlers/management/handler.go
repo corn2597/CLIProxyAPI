@@ -51,6 +51,7 @@ type Handler struct {
 	postAuthPersistHook coreauth.PostAuthHook
 	pluginHost          *pluginhost.Host
 	riskBlockStore      *riskcontrol.BlockEventStore
+	riskObserveStore    *riskcontrol.BlockEventStore
 	riskOverrideStore   *riskcontrol.OverrideStore
 	riskSampleStore     *riskcontrol.SampleStore
 }
@@ -69,6 +70,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
 		riskBlockStore:      riskcontrol.DefaultBlockedEventStore(),
+		riskObserveStore:    riskcontrol.DefaultObserveEventStore(),
 		riskOverrideStore:   riskcontrol.DefaultOverrideStore(),
 		riskSampleStore:     riskcontrol.DefaultSampleStore(),
 	}

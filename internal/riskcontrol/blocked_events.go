@@ -21,9 +21,10 @@ const (
 )
 
 const (
-	DecisionSourceFreshAudit = "fresh_audit"
-	DecisionSourceCache      = "session_cache"
-	DecisionSourceBlockedBan = "blocked_ban"
+	DecisionSourceFreshAudit  = "fresh_audit"
+	DecisionSourceCache       = "session_cache"
+	DecisionSourceBlockedBan  = "blocked_ban"
+	DecisionSourceObserveOnly = "observe_only"
 )
 
 // BlockEvent captures a request that was actively blocked by risk control.
@@ -83,10 +84,21 @@ type BlockEventStore struct {
 }
 
 var defaultBlockedEventStore = NewBlockEventStore(defaultBlockedEventRetentionLimit)
+var defaultObserveEventStore = NewBlockEventStore(defaultBlockedEventRetentionLimit)
 
 // DefaultBlockedEventStore returns the process-wide blocked-event store.
 func DefaultBlockedEventStore() *BlockEventStore {
 	return defaultBlockedEventStore
+}
+
+// DefaultObserveEventStore returns the process-wide observe-only audit-event store.
+func DefaultObserveEventStore() *BlockEventStore {
+	return defaultObserveEventStore
+}
+
+// ConfigureDefaultObserveEventStore enables observe-only audit-event persistence for the process-wide store.
+func ConfigureDefaultObserveEventStore(filePath string) error {
+	return defaultObserveEventStore.ConfigurePersistence(filePath, defaultBlockedEventRetentionLimit)
 }
 
 // NewBlockEventStore creates a blocked-event store.

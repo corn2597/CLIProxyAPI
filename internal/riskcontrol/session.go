@@ -23,6 +23,7 @@ type Decision struct {
 	Evidence          []string
 	RawResponse       string
 	FailureClass      string
+	ObserveOnly       bool
 }
 
 type sessionState struct {

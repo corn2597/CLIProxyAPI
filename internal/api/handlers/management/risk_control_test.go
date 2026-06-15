@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -84,7 +85,12 @@ func TestGetRiskControlPageServesStandaloneHTML(t *testing.T) {
 	for _, want := range []string{
 		"Risk Control Blocks",
 		"/v0/management/risk-control/blocks",
+		"/v0/management/risk-control/observations",
 		"Load older",
+		"Observe",
+		"Observe-only audit events",
+		"Observe ALLOW label saved",
+		"Observe BLOCK label saved",
 		"status-success",
 		"status-error",
 		"readResponsePayload",
@@ -95,6 +101,46 @@ func TestGetRiskControlPageServesStandaloneHTML(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("page body missing %q", want)
 		}
+	}
+}
+
+func TestGetRiskControlObservationsReturnsPaginatedEvents(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	store := riskcontrol.NewBlockEventStore(8)
+	store.RecordBlockedEvent(riskcontrol.BlockEvent{
+		BlockedAt:       time.Date(2026, 6, 10, 10, 0, 0, 0, time.UTC),
+		SessionID:       "execution:observe-one",
+		Reason:          "observe reason",
+		DecisionSource:  riskcontrol.DecisionSourceObserveOnly,
+		PolicyCode:      "malicious_cyber_abuse",
+		SubcategoryCode: "unauthorized_third_party_access",
+	})
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/risk-control/observations?limit=20", nil)
+
+	h := &Handler{riskObserveStore: store}
+	h.GetRiskControlObservations(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var payload struct {
+		Items    []riskcontrol.BlockEvent `json:"items"`
+		Returned int                      `json:"returned"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, rec.Body.String())
+	}
+	if payload.Returned != 1 || len(payload.Items) != 1 {
+		t.Fatalf("returned items = %d/%d, want 1/1", payload.Returned, len(payload.Items))
+	}
+	if payload.Items[0].DecisionSource != riskcontrol.DecisionSourceObserveOnly {
+		t.Fatalf("DecisionSource = %q, want observe_only", payload.Items[0].DecisionSource)
 	}
 }
 
@@ -193,5 +239,83 @@ func TestPostRiskControlAllowSessionCreatesOverrideAndSample(t *testing.T) {
 		t.Fatalf("Match after TTL: %v", err)
 	} else if ok {
 		t.Fatal("session override should expire after configured TTL")
+	}
+}
+
+func TestPostRiskControlObservationLabelsSamples(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	store := riskcontrol.NewBlockEventStore(8)
+	store.RecordBlockedEvent(riskcontrol.BlockEvent{
+		BlockedAt:       time.Date(2026, 6, 10, 10, 0, 0, 0, time.UTC),
+		SessionID:       "execution:observe-two",
+		InputHash:       "observe-hash-two",
+		UserTextPreview: "ssh root@example.com collect logs",
+		DecisionSource:  riskcontrol.DecisionSourceObserveOnly,
+		PolicyCode:      "malicious_cyber_abuse",
+		SubcategoryCode: "unauthorized_third_party_access",
+		Confidence:      0.99,
+		Reason:          "observe only",
+	})
+
+	samplePath := filepath.Join(t.TempDir(), "samples.jsonl")
+	samples := riskcontrol.NewSampleStore()
+	if err := samples.ConfigurePersistence(samplePath); err != nil {
+		t.Fatalf("ConfigurePersistence(samples): %v", err)
+	}
+	h := &Handler{
+		riskObserveStore: store,
+		riskSampleStore:  samples,
+	}
+
+	for _, tc := range []struct {
+		name       string
+		path       string
+		handler    func(*gin.Context)
+		wantLabel  string
+		wantAction string
+	}{
+		{
+			name:       "allow",
+			path:       "/v0/management/risk-control/observations/1/allow",
+			handler:    h.PostRiskControlObservationAllow,
+			wantLabel:  riskcontrol.SampleShouldAllow,
+			wantAction: "observe_allow",
+		},
+		{
+			name:       "block",
+			path:       "/v0/management/risk-control/observations/1/block",
+			handler:    h.PostRiskControlObservationBlock,
+			wantLabel:  riskcontrol.SampleShouldBlock,
+			wantAction: "observe_block",
+		},
+	} {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Params = gin.Params{{Key: "id", Value: "1"}}
+		c.Request = httptest.NewRequest(http.MethodPost, tc.path, nil)
+		tc.handler(c)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want %d body=%s", tc.name, rec.Code, http.StatusOK, rec.Body.String())
+		}
+
+		var payload struct {
+			Sample riskcontrol.SampleRecord `json:"sample"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("%s decode response: %v body=%s", tc.name, err, rec.Body.String())
+		}
+		if payload.Sample.Label != tc.wantLabel || payload.Sample.Action != tc.wantAction {
+			t.Fatalf("%s sample label/action = %q/%q, want %q/%q", tc.name, payload.Sample.Label, payload.Sample.Action, tc.wantLabel, tc.wantAction)
+		}
+	}
+
+	raw, err := os.ReadFile(samplePath)
+	if err != nil {
+		t.Fatalf("read sample file: %v", err)
+	}
+	if got := strings.Count(strings.TrimSpace(string(raw)), "\n") + 1; got != 2 {
+		t.Fatalf("sample line count = %d, want 2; file=%s", got, string(raw))
 	}
 }

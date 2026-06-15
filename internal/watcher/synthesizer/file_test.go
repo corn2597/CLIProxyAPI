@@ -166,6 +166,43 @@ func TestFileSynthesizer_Synthesize_GeminiProviderMapping(t *testing.T) {
 	}
 }
 
+func TestFileSynthesizer_Synthesize_CodexOAuthBaseURL(t *testing.T) {
+	tempDir := t.TempDir()
+
+	authData := map[string]any{
+		"type":         "codex",
+		"email":        "codex@example.com",
+		"access_token": "oauth-token",
+		"base_url":     " http://127.0.0.1:18080 ",
+	}
+	data, _ := json.Marshal(authData)
+	if err := os.WriteFile(filepath.Join(tempDir, "codex-auth.json"), data, 0644); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	if auths[0].Provider != "codex" {
+		t.Fatalf("provider = %q, want codex", auths[0].Provider)
+	}
+	if got := auths[0].Attributes["base_url"]; got != "http://127.0.0.1:18080" {
+		t.Fatalf("base_url attribute = %q", got)
+	}
+}
+
 func TestFileSynthesizer_Synthesize_SkipsInvalidFiles(t *testing.T) {
 	tempDir := t.TempDir()
 

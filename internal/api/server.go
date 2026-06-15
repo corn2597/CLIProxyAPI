@@ -757,6 +757,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/risk-control/blocks/:id/allow-once", s.mgmt.PostRiskControlAllowOnce)
 		mgmt.POST("/risk-control/blocks/:id/allow-session", s.mgmt.PostRiskControlAllowSession)
 		mgmt.POST("/risk-control/blocks/:id/confirm-block", s.mgmt.PostRiskControlConfirmBlock)
+		mgmt.GET("/risk-control/observations", s.mgmt.GetRiskControlObservations)
+		mgmt.POST("/risk-control/observations/:id/allow", s.mgmt.PostRiskControlObservationAllow)
+		mgmt.POST("/risk-control/observations/:id/block", s.mgmt.PostRiskControlObservationBlock)
 		mgmt.GET("/risk-control/page", s.mgmt.GetRiskControlPage)
 	}
 }
@@ -915,6 +918,10 @@ func (s *Server) configureRiskControlBlockedEventStore(logDir string) {
 	filePath := filepath.Join(logDir, "risk-control-blocks.jsonl")
 	if err := riskcontrol.DefaultBlockedEventStore().ConfigurePersistence(filePath, 0); err != nil {
 		log.WithError(err).Warn("risk control: blocked-event store persistence configuration failed")
+	}
+	observeFilePath := filepath.Join(logDir, "risk-control-observe.jsonl")
+	if err := riskcontrol.ConfigureDefaultObserveEventStore(observeFilePath); err != nil {
+		log.WithError(err).Warn("risk control: observe-event store persistence configuration failed")
 	}
 	banFilePath := filepath.Join(logDir, "risk-control-session-bans.json")
 	if err := riskcontrol.ConfigureDefaultSessionBanStore(banFilePath); err != nil {
