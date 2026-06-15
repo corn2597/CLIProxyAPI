@@ -164,19 +164,20 @@ codex:
 #   enabled: false
 #   mode: "observe"                 # off, observe, pre_block
 #   base-url: "https://api.example.com/v1"
-#   endpoint: "chat-completions"    # chat-completions or moderations
+#   endpoint: "responses"           # responses (recommended), chat-completions, or moderations
 #   model: "audit-model"
 #   api-key: "sk-..."
 #   # api-keys: ["sk-1", "sk-2"]    # optional independent audit key rotation
 #   session-audit-interval: "5m"
 #   session-ttl: "24h"
 #   blocked-session-ttl: "168h"     # blacklist a blocked session_id for 7 days
+#   block-threshold: 0.97
 #   timeout-ms: 3000
 #   fail-policy: "open"             # open or closed
 #   block-status: 403
 #   block-message: "risk control audit blocked this request"
-#   max-input-runes: 12000
-#   max-input-images: 1
+#   # max-input-runes / max-input-images are deprecated in risk control v2:
+#   # full user-role input is forwarded to the audit model without local clipping.
 #   # prompt is deprecated and ignored; the server uses an internal OpenAI policy profile
 #   # prompt: "..."
 

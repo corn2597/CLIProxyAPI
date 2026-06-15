@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/riskcontrol"
@@ -12,8 +13,8 @@ import (
 
 // GetRiskControlBlocks lists persisted risk-control block events.
 func (h *Handler) GetRiskControlBlocks(c *gin.Context) {
-	reader := h.riskBlockEvents()
-	if reader == nil {
+	store := h.riskBlockEvents()
+	if store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "risk control block log unavailable"})
 		return
 	}
@@ -30,12 +31,74 @@ func (h *Handler) GetRiskControlBlocks(c *gin.Context) {
 		return
 	}
 
-	page := reader.ListBlockedEvents(riskcontrol.BlockEventListOptions{
+	page := store.ListBlockedEvents(riskcontrol.BlockEventListOptions{
 		SessionID: c.Query("session_id"),
 		BeforeID:  beforeID,
 		Limit:     limit,
 	})
 	c.JSON(http.StatusOK, page)
+}
+
+// PostRiskControlAllowOnce creates an input-hash-based allow-once override and labels a should_allow sample.
+func (h *Handler) PostRiskControlAllowOnce(c *gin.Context) {
+	event, ok := h.lookupRiskControlEvent(c)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(event.InputHash) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "selected block event does not contain input_hash"})
+		return
+	}
+	now := time.Now().UTC()
+	override, err := h.riskOverrides().AllowOnce(event.InputHash, event.SessionID, event.ID, now)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	sample, err := h.riskSamples().Append(riskcontrol.NewSampleRecordFromBlockEvent(event, riskcontrol.SampleShouldAllow, riskcontrol.OverrideAllowOnce, now))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"override": override, "sample": sample})
+}
+
+// PostRiskControlAllowSession creates a session-scoped allow override and labels a should_allow sample.
+func (h *Handler) PostRiskControlAllowSession(c *gin.Context) {
+	event, ok := h.lookupRiskControlEvent(c)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(event.SessionID) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "selected block event does not contain session_id"})
+		return
+	}
+	now := time.Now().UTC()
+	override, err := h.riskOverrides().AllowSession(event.SessionID, event.InputHash, event.ID, now.Add(h.sessionOverrideTTL()), now)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	sample, err := h.riskSamples().Append(riskcontrol.NewSampleRecordFromBlockEvent(event, riskcontrol.SampleShouldAllow, riskcontrol.OverrideAllowSession, now))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"override": override, "sample": sample})
+}
+
+// PostRiskControlConfirmBlock labels a blocked event as a correct should_block sample.
+func (h *Handler) PostRiskControlConfirmBlock(c *gin.Context) {
+	event, ok := h.lookupRiskControlEvent(c)
+	if !ok {
+		return
+	}
+	sample, err := h.riskSamples().Append(riskcontrol.NewSampleRecordFromBlockEvent(event, riskcontrol.SampleShouldBlock, "confirm_block", time.Now().UTC()))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"sample": sample})
 }
 
 // GetRiskControlPage serves a standalone management page for blocked-session inspection.
@@ -44,11 +107,60 @@ func (h *Handler) GetRiskControlPage(c *gin.Context) {
 	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(riskControlPageHTML))
 }
 
-func (h *Handler) riskBlockEvents() riskcontrol.BlockEventReader {
-	if h != nil && h.riskBlockReader != nil {
-		return h.riskBlockReader
+func (h *Handler) lookupRiskControlEvent(c *gin.Context) (riskcontrol.BlockEvent, bool) {
+	store := h.riskBlockEvents()
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "risk control block log unavailable"})
+		return riskcontrol.BlockEvent{}, false
+	}
+	id, err := parseUintQuery(c.Param("id"))
+	if err != nil || id == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid block id"})
+		return riskcontrol.BlockEvent{}, false
+	}
+	event, ok := store.GetBlockedEventByID(id)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "block event not found"})
+		return riskcontrol.BlockEvent{}, false
+	}
+	return event, true
+}
+
+func (h *Handler) riskBlockEvents() *riskcontrol.BlockEventStore {
+	if h != nil && h.riskBlockStore != nil {
+		return h.riskBlockStore
 	}
 	return riskcontrol.DefaultBlockedEventStore()
+}
+
+func (h *Handler) riskOverrides() *riskcontrol.OverrideStore {
+	if h != nil && h.riskOverrideStore != nil {
+		return h.riskOverrideStore
+	}
+	return riskcontrol.DefaultOverrideStore()
+}
+
+func (h *Handler) riskSamples() *riskcontrol.SampleStore {
+	if h != nil && h.riskSampleStore != nil {
+		return h.riskSampleStore
+	}
+	return riskcontrol.DefaultSampleStore()
+}
+
+func (h *Handler) sessionOverrideTTL() time.Duration {
+	const fallback = 7 * 24 * time.Hour
+	if h == nil || h.cfg == nil {
+		return fallback
+	}
+	raw := strings.TrimSpace(h.cfg.RiskControl.BlockedSessionTTL)
+	if raw == "" {
+		return fallback
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
 }
 
 func parseUintQuery(raw string) (uint64, error) {
@@ -74,622 +186,421 @@ const riskControlPageHTML = `<!DOCTYPE html>
       color-scheme: dark;
       --bg: #0d1117;
       --panel: #161b22;
-      --panel-alt: #0f141a;
+      --muted: #8b949e;
       --border: #30363d;
       --text: #e6edf3;
-      --muted: #8b949e;
-      --danger: #ff7b72;
       --accent: #58a6ff;
+      --danger: #ff7b72;
       --ok: #3fb950;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      background: var(--bg);
-      color: var(--text);
       font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+      background: radial-gradient(circle at top, #131b26, var(--bg) 55%);
     }
-    a { color: var(--accent); }
     main {
-      max-width: 1480px;
+      max-width: 1440px;
       margin: 0 auto;
       padding: 20px;
     }
-    header {
-      display: flex;
-      justify-content: space-between;
-      gap: 16px;
-      align-items: flex-end;
-      margin-bottom: 16px;
-      flex-wrap: wrap;
-    }
-    h1 {
-      margin: 0;
-      font-size: 24px;
-      font-weight: 600;
-    }
-    .subtle {
-      color: var(--muted);
-      font-size: 13px;
-    }
-    .toolbar, .layout > section, .layout > aside {
+    h1 { margin: 0 0 6px; font-size: 28px; }
+    .subtle { color: var(--muted); }
+    .toolbar, .panel {
+      background: rgba(22, 27, 34, 0.92);
       border: 1px solid var(--border);
-      background: var(--panel);
+      border-radius: 16px;
+      box-shadow: 0 18px 48px rgba(0, 0, 0, 0.24);
     }
     .toolbar {
       display: grid;
-      grid-template-columns: minmax(220px, 1.3fr) minmax(220px, 1.6fr) 120px auto 1fr;
+      grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) minmax(180px, 1.4fr) auto auto;
       gap: 12px;
-      padding: 12px;
-      margin-bottom: 16px;
       align-items: end;
+      padding: 16px;
+      margin: 18px 0;
     }
     .field {
       display: flex;
       flex-direction: column;
       gap: 6px;
     }
-    .field span {
+    .field label {
       color: var(--muted);
       font-size: 12px;
     }
-    input, select, button {
-      height: 36px;
+    input, button, textarea {
       border: 1px solid var(--border);
-      background: var(--panel-alt);
+      background: #0f141a;
       color: var(--text);
-      padding: 0 10px;
+      border-radius: 10px;
+      padding: 10px 12px;
       font: inherit;
     }
     button {
       cursor: pointer;
-      min-width: 96px;
+      min-height: 40px;
     }
-    button:disabled {
-      opacity: 0.45;
-      cursor: default;
-    }
-    .toolbar-actions {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-    #status {
-      text-align: right;
-      color: var(--muted);
-      min-height: 20px;
-      align-self: center;
-    }
+    button.primary { background: rgba(88,166,255,0.18); }
+    button.warn { background: rgba(255,123,114,0.14); }
+    button.ok { background: rgba(63,185,80,0.16); }
+    button:disabled { opacity: 0.45; cursor: default; }
     .layout {
       display: grid;
-      grid-template-columns: minmax(0, 1.45fr) minmax(320px, 0.95fr);
+      grid-template-columns: minmax(0, 1.5fr) minmax(340px, 0.95fr);
       gap: 16px;
-      align-items: start;
     }
-    .list-panel {
-      overflow: hidden;
-    }
-    .panel-title {
+    .panel-header {
       display: flex;
       justify-content: space-between;
+      align-items: center;
       gap: 12px;
-      padding: 12px 14px;
+      padding: 14px 16px;
       border-bottom: 1px solid var(--border);
-      background: #11161d;
-      font-weight: 600;
     }
     .table-wrap {
       overflow: auto;
-      max-height: calc(100vh - 230px);
+      max-height: calc(100vh - 250px);
     }
     table {
       width: 100%;
       border-collapse: collapse;
     }
     th, td {
-      padding: 10px 12px;
-      border-bottom: 1px solid rgba(48, 54, 61, 0.7);
       text-align: left;
       vertical-align: top;
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(48,54,61,0.7);
     }
     th {
       position: sticky;
       top: 0;
       background: #11161d;
-      z-index: 1;
       color: var(--muted);
-      font-weight: 500;
+      z-index: 1;
     }
-    tbody tr {
-      cursor: pointer;
-    }
-    tbody tr:hover {
-      background: rgba(88, 166, 255, 0.08);
-    }
-    tbody tr.selected {
-      background: rgba(88, 166, 255, 0.14);
-    }
-    .reason {
-      color: var(--danger);
-      font-weight: 600;
-    }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover { background: rgba(88,166,255,0.08); }
+    tbody tr.selected { background: rgba(88,166,255,0.14); }
     .chip {
       display: inline-flex;
       align-items: center;
+      gap: 6px;
       border: 1px solid var(--border);
-      padding: 2px 8px;
-      height: 24px;
-      background: var(--panel-alt);
+      border-radius: 999px;
+      padding: 2px 10px;
       font-size: 12px;
       white-space: nowrap;
     }
-    .chip.ok {
-      color: var(--ok);
-    }
-    .chip.warn {
-      color: var(--danger);
-    }
-    .empty {
-      padding: 24px;
-      color: var(--muted);
-    }
-    .detail-panel {
-      min-height: 540px;
-    }
-    .detail-body {
-      padding: 14px;
+    .chip.warn { color: var(--danger); }
+    .chip.ok { color: var(--ok); }
+    .detail {
+      padding: 16px;
       display: grid;
       gap: 14px;
     }
     .detail-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px 14px;
+      gap: 12px;
     }
-    .detail-item {
-      min-width: 0;
-    }
-    .detail-item .label {
+    .detail-grid div { min-width: 0; }
+    .detail-grid strong, .section strong {
       display: block;
+      margin-bottom: 6px;
       color: var(--muted);
       font-size: 12px;
-      margin-bottom: 4px;
-    }
-    .detail-item .value {
-      word-break: break-word;
+      font-weight: 500;
     }
     pre {
       margin: 0;
       padding: 12px;
-      border: 1px solid var(--border);
-      background: var(--panel-alt);
       overflow: auto;
+      background: #0f141a;
+      border: 1px solid var(--border);
+      border-radius: 10px;
       white-space: pre-wrap;
       word-break: break-word;
-      font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
     }
-    ul {
-      margin: 0;
-      padding-left: 18px;
+    .actions {
+      display: grid;
+      gap: 10px;
     }
-    .footer-row {
-      padding: 12px 14px;
-      border-top: 1px solid var(--border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
+    .status {
+      min-height: 20px;
       color: var(--muted);
     }
     @media (max-width: 1100px) {
-      .toolbar {
-        grid-template-columns: 1fr 120px;
-      }
-      #status {
-        text-align: left;
-        grid-column: 1 / -1;
-      }
-      .layout {
-        grid-template-columns: 1fr;
-      }
-      .table-wrap {
-        max-height: none;
-      }
-      .detail-grid {
-        grid-template-columns: 1fr;
-      }
+      .toolbar, .layout { grid-template-columns: 1fr; }
+      .detail-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
   <main>
-    <header>
-      <div>
-        <h1>Risk Control Blocks</h1>
-        <div class="subtle">Persisted to a local file. Only the latest 20 blocked requests are retained, including cached session decisions reused within the audit sampling window.</div>
-      </div>
-      <div class="subtle">Path: <code>/management-risk-control.html</code></div>
-    </header>
+    <h1>Risk Control Blocks</h1>
+    <div class="subtle">Path: <code>/management-risk-control.html</code> · API: <code>/v0/management/risk-control/blocks</code></div>
 
     <section class="toolbar">
-      <label class="field">
-        <span>Management key</span>
-        <input id="managementKey" type="password" autocomplete="off" placeholder="Bearer key or X-Management-Key">
-      </label>
-      <label class="field">
-        <span>Session filter</span>
-        <input id="sessionFilter" type="text" placeholder="execution:..., header:..., raw session fragment">
-      </label>
-      <label class="field">
-        <span>Page size</span>
-        <select id="limitSelect">
-          <option value="5">5</option>
-          <option value="10">10</option>
-          <option value="20" selected>20</option>
-        </select>
-      </label>
-      <div class="toolbar-actions">
-        <button id="applyBtn" type="button">Apply</button>
-        <button id="refreshBtn" type="button">Refresh</button>
-        <button id="loadMoreBtn" type="button" disabled>Load older</button>
+      <div class="field">
+        <label for="sessionFilter">Session filter</label>
+        <input id="sessionFilter" placeholder="execution:..., prompt-cache:..., request:...">
       </div>
-      <div id="status"></div>
+      <div class="field">
+        <label for="limit">Batch size</label>
+        <input id="limit" type="number" value="20" min="1" max="100">
+      </div>
+      <div class="field">
+        <label for="managementKey">Management key</label>
+        <input id="managementKey" type="password" placeholder="Bearer or X-Management-Key">
+      </div>
+      <button id="loadBtn" class="primary">Load</button>
+      <button id="loadOlderBtn">Load older</button>
     </section>
 
-    <div class="layout">
-      <section class="list-panel">
-        <div class="panel-title">
-          <span>Blocked requests</span>
-          <span id="countBadge" class="subtle">0 loaded</span>
+    <div class="status" id="status"></div>
+
+    <section class="layout">
+      <section class="panel">
+        <div class="panel-header">
+          <div>Recent blocked events</div>
+          <div class="subtle" id="countLabel">0 rows</div>
         </div>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th style="width: 188px;">Blocked at</th>
-                <th style="width: 220px;">Session</th>
-                <th style="width: 160px;">Reason</th>
-                <th style="width: 130px;">Decision</th>
-                <th style="width: 170px;">Model</th>
-                <th>Preview</th>
+                <th>ID</th>
+                <th>Blocked At</th>
+                <th>Session</th>
+                <th>Policy</th>
+                <th>Confidence</th>
+                <th>Reason</th>
               </tr>
             </thead>
-            <tbody id="rows"></tbody>
+            <tbody id="rows">
+              <tr><td colspan="6" class="subtle">No data loaded yet.</td></tr>
+            </tbody>
           </table>
-          <div id="emptyState" class="empty" hidden>No blocked requests recorded in the retained 20-entry history for the current filter.</div>
-        </div>
-        <div class="footer-row">
-          <span>Newest entries first, latest 20 retained</span>
-          <span id="paginationHint"></span>
         </div>
       </section>
 
-      <aside class="detail-panel">
-        <div class="panel-title">
-          <span>Block details</span>
-          <span id="detailHint" class="subtle">Select a row</span>
+      <aside class="panel">
+        <div class="panel-header">
+          <div>Selected event</div>
+          <div id="selectedID" class="subtle">none</div>
         </div>
-        <div id="detailBody" class="detail-body">
-          <div class="empty">Select a blocked request to inspect why the session was intercepted.</div>
+        <div class="detail">
+          <div class="detail-grid">
+            <div><strong>Session ID</strong><div id="detailSession">-</div></div>
+            <div><strong>Decision source</strong><div id="detailDecisionSource">-</div></div>
+            <div><strong>Policy code</strong><div id="detailPolicy">-</div></div>
+            <div><strong>Subcategory</strong><div id="detailSubcategory">-</div></div>
+            <div><strong>Confidence</strong><div id="detailConfidence">-</div></div>
+            <div><strong>Authorized context</strong><div id="detailAuthorized">-</div></div>
+          </div>
+
+          <div class="section">
+            <strong>Evidence</strong>
+            <pre id="detailEvidence">-</pre>
+          </div>
+
+          <div class="section">
+            <strong>User input</strong>
+            <pre id="detailInput">-</pre>
+          </div>
+
+          <div class="section">
+            <strong>Raw audit response</strong>
+            <pre id="detailRaw">-</pre>
+          </div>
+
+          <div class="actions">
+            <button id="allowOnceBtn" class="ok" disabled>Allow once</button>
+            <button id="allowSessionBtn" class="primary" disabled>Allow session</button>
+            <button id="confirmBlockBtn" class="warn" disabled>Confirm block</button>
+          </div>
         </div>
       </aside>
-    </div>
+    </section>
   </main>
 
   <script>
-    (function () {
-      var endpoint = '/v0/management/risk-control/blocks';
-      var state = {
-        items: [],
-        selectedID: 0,
-        nextBeforeID: 0,
-        hasMore: false,
-        total: 0,
-        loading: false
-      };
+    var rowsEl = document.getElementById('rows');
+    var statusEl = document.getElementById('status');
+    var countLabelEl = document.getElementById('countLabel');
+    var selectedIDEl = document.getElementById('selectedID');
+    var detailSessionEl = document.getElementById('detailSession');
+    var detailDecisionSourceEl = document.getElementById('detailDecisionSource');
+    var detailPolicyEl = document.getElementById('detailPolicy');
+    var detailSubcategoryEl = document.getElementById('detailSubcategory');
+    var detailConfidenceEl = document.getElementById('detailConfidence');
+    var detailAuthorizedEl = document.getElementById('detailAuthorized');
+    var detailEvidenceEl = document.getElementById('detailEvidence');
+    var detailInputEl = document.getElementById('detailInput');
+    var detailRawEl = document.getElementById('detailRaw');
+    var managementKeyEl = document.getElementById('managementKey');
+    var sessionFilterEl = document.getElementById('sessionFilter');
+    var limitEl = document.getElementById('limit');
+    var allowOnceBtn = document.getElementById('allowOnceBtn');
+    var allowSessionBtn = document.getElementById('allowSessionBtn');
+    var confirmBlockBtn = document.getElementById('confirmBlockBtn');
+    var loadOlderBtn = document.getElementById('loadOlderBtn');
 
-      var managementKeyInput = document.getElementById('managementKey');
-      var sessionFilter = document.getElementById('sessionFilter');
-      var limitSelect = document.getElementById('limitSelect');
-      var applyBtn = document.getElementById('applyBtn');
-      var refreshBtn = document.getElementById('refreshBtn');
-      var loadMoreBtn = document.getElementById('loadMoreBtn');
-      var statusNode = document.getElementById('status');
-      var countBadge = document.getElementById('countBadge');
-      var paginationHint = document.getElementById('paginationHint');
-      var rowsNode = document.getElementById('rows');
-      var emptyState = document.getElementById('emptyState');
-      var detailBody = document.getElementById('detailBody');
-      var detailHint = document.getElementById('detailHint');
+    var selected = null;
+    var nextBeforeID = 0;
+    var hasMore = false;
+    var items = [];
 
-      function escapeHTML(value) {
-        return String(value || '')
-          .replace(/&/g, '&amp;')
-          .replace(/</g, '&lt;')
-          .replace(/>/g, '&gt;')
-          .replace(/"/g, '&quot;')
-          .replace(/'/g, '&#39;');
+    function currentKey() {
+      return (managementKeyEl.value || '').trim();
+    }
+
+    function setStatus(message, isError) {
+      statusEl.textContent = message || '';
+      statusEl.style.color = isError ? 'var(--danger)' : 'var(--muted)';
+    }
+
+    function headers() {
+      var hdr = {};
+      var key = currentKey();
+      if (key) {
+        hdr['X-Management-Key'] = key;
+        window.sessionStorage.setItem('risk-control-management-key', key);
+      }
+      return hdr;
+    }
+
+    function renderRows() {
+      if (!items.length) {
+        rowsEl.innerHTML = '<tr><td colspan="6" class="subtle">No events matched.</td></tr>';
+      } else {
+        rowsEl.innerHTML = items.map(function(item) {
+          var selectedClass = selected && selected.id === item.id ? ' class="selected"' : '';
+          return '<tr data-id="' + item.id + '"' + selectedClass + '>' +
+            '<td>' + item.id + '</td>' +
+            '<td>' + escapeHTML(item.blocked_at || '') + '</td>' +
+            '<td>' + escapeHTML(item.session_id || '') + '</td>' +
+            '<td>' + escapeHTML(item.policy_code || '-') + '</td>' +
+            '<td>' + escapeHTML(formatConfidence(item.confidence)) + '</td>' +
+            '<td>' + escapeHTML(item.reason || item.audit_error || '-') + '</td>' +
+          '</tr>';
+        }).join('');
+      }
+      countLabelEl.textContent = items.length + ' rows';
+      loadOlderBtn.disabled = !hasMore;
+    }
+
+    function renderDetail() {
+      var item = selected;
+      selectedIDEl.textContent = item ? String(item.id) : 'none';
+      detailSessionEl.textContent = item ? (item.session_id || '-') : '-';
+      detailDecisionSourceEl.textContent = item ? (item.decision_source || '-') : '-';
+      detailPolicyEl.textContent = item ? (item.policy_code || '-') : '-';
+      detailSubcategoryEl.textContent = item ? (item.subcategory_code || '-') : '-';
+      detailConfidenceEl.textContent = item ? formatConfidence(item.confidence) : '-';
+      detailAuthorizedEl.textContent = item ? (item.authorized_context || '-') : '-';
+      detailEvidenceEl.textContent = item && item.evidence && item.evidence.length ? item.evidence.join('\n') : '-';
+      detailInputEl.textContent = item ? (item.user_text_preview || '-') : '-';
+      detailRawEl.textContent = item ? (item.raw_audit_response || '-') : '-';
+      allowOnceBtn.disabled = !item || !item.input_hash;
+      allowSessionBtn.disabled = !item || !item.session_id;
+      confirmBlockBtn.disabled = !item;
+      renderRows();
+    }
+
+    function formatConfidence(value) {
+      if (typeof value !== 'number') {
+        return '-';
+      }
+      return value.toFixed(2);
+    }
+
+    function escapeHTML(value) {
+      return String(value || '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+    }
+
+    async function loadBlocks(append) {
+      var params = new URLSearchParams();
+      var sessionID = (sessionFilterEl.value || '').trim();
+      if (sessionID) params.set('session_id', sessionID);
+      var limit = Math.max(1, Math.min(100, Number(limitEl.value || 20)));
+      params.set('limit', String(limit));
+      if (append && nextBeforeID) params.set('before_id', String(nextBeforeID));
+
+      setStatus('Loading...');
+      var resp = await fetch('/v0/management/risk-control/blocks?' + params.toString(), { headers: headers() });
+      var payload = await resp.json();
+      if (!resp.ok) {
+        throw new Error(payload.error || ('HTTP ' + resp.status));
       }
 
-      function formatTime(value) {
-        if (!value) {
-          return '-';
-        }
-        var date = new Date(value);
-        if (Number.isNaN(date.getTime())) {
-          return value;
-        }
-        return date.toLocaleString();
+      nextBeforeID = payload.next_before_id || 0;
+      hasMore = !!payload.has_more;
+      items = append ? items.concat(payload.items || []) : (payload.items || []);
+      if (!selected && items.length) {
+        selected = items[0];
+      } else if (selected) {
+        selected = items.find(function(item) { return item.id === selected.id; }) || null;
       }
+      renderDetail();
+      setStatus('Loaded ' + (payload.returned || 0) + ' rows.');
+    }
 
-      function previewText(value) {
-        var text = String(value || '').replace(/\s+/g, ' ').trim();
-        if (!text) {
-          return '-';
-        }
-        if (text.length > 120) {
-          return text.slice(0, 120) + '...';
-        }
-        return text;
+    async function postAction(path, successMessage) {
+      if (!selected) return;
+      setStatus('Submitting...');
+      var resp = await fetch(path, { method: 'POST', headers: headers() });
+      var payload = await resp.json();
+      if (!resp.ok) {
+        throw new Error(payload.error || ('HTTP ' + resp.status));
       }
+      setStatus(successMessage);
+    }
 
-      function decisionLabel(item) {
-        return item && item.decision_source === 'session_cache' ? 'session cache' : 'fresh audit';
-      }
+    rowsEl.addEventListener('click', function(event) {
+      var row = event.target.closest('tr[data-id]');
+      if (!row) return;
+      var id = Number(row.getAttribute('data-id'));
+      selected = items.find(function(item) { return item.id === id; }) || null;
+      renderDetail();
+    });
 
-      function setStatus(text, isError) {
-        statusNode.textContent = text || '';
-        statusNode.style.color = isError ? 'var(--danger)' : 'var(--muted)';
-      }
+    document.getElementById('loadBtn').addEventListener('click', function() {
+      selected = null;
+      nextBeforeID = 0;
+      hasMore = false;
+      loadBlocks(false).catch(function(err) { setStatus(err.message, true); });
+    });
 
-      function buildURL(reset) {
-        var url = new URL(endpoint, window.location.href);
-        var sessionID = sessionFilter.value.trim();
-        var limit = limitSelect.value;
-        if (sessionID) {
-          url.searchParams.set('session_id', sessionID);
-        }
-        if (limit) {
-          url.searchParams.set('limit', limit);
-        }
-        if (!reset && state.nextBeforeID) {
-          url.searchParams.set('before_id', String(state.nextBeforeID));
-        }
-        return url;
-      }
+    loadOlderBtn.addEventListener('click', function() {
+      loadBlocks(true).catch(function(err) { setStatus(err.message, true); });
+    });
 
-      function currentManagementKey() {
-        return managementKeyInput.value.trim();
-      }
+    allowOnceBtn.addEventListener('click', function() {
+      postAction('/v0/management/risk-control/blocks/' + selected.id + '/allow-once', 'Allow-once override created and sample labeled.')
+        .catch(function(err) { setStatus(err.message, true); });
+    });
 
-      function selectedItem() {
-        for (var i = 0; i < state.items.length; i++) {
-          if (state.items[i].id === state.selectedID) {
-            return state.items[i];
-          }
-        }
-        return state.items.length > 0 ? state.items[0] : null;
-      }
+    allowSessionBtn.addEventListener('click', function() {
+      postAction('/v0/management/risk-control/blocks/' + selected.id + '/allow-session', 'Session override created and sample labeled.')
+        .catch(function(err) { setStatus(err.message, true); });
+    });
 
-      function renderRows() {
-        if (!state.items.length) {
-          rowsNode.innerHTML = '';
-          emptyState.hidden = false;
-          countBadge.textContent = '0 loaded';
-          paginationHint.textContent = '';
-          return;
-        }
+    confirmBlockBtn.addEventListener('click', function() {
+      postAction('/v0/management/risk-control/blocks/' + selected.id + '/confirm-block', 'Block sample confirmed.')
+        .catch(function(err) { setStatus(err.message, true); });
+    });
 
-        emptyState.hidden = true;
-        countBadge.textContent = String(state.items.length) + ' loaded';
-        paginationHint.textContent = state.hasMore ? 'More history available' : 'No more older entries';
-
-        var html = '';
-        for (var i = 0; i < state.items.length; i++) {
-          var item = state.items[i];
-          var selected = item.id === state.selectedID ? ' selected' : '';
-          html += '<tr class="' + selected + '" data-id="' + item.id + '">';
-          html += '<td>' + escapeHTML(formatTime(item.blocked_at)) + '</td>';
-          html += '<td><div>' + escapeHTML(item.session_id || '-') + '</div><div class="subtle">' + escapeHTML(item.request_path || '-') + '</div></td>';
-          html += '<td><span class="reason">' + escapeHTML(item.reason || 'blocked') + '</span></td>';
-          html += '<td><span class="chip ' + (item.decision_source === 'session_cache' ? 'warn' : 'ok') + '">' + escapeHTML(decisionLabel(item)) + '</span></td>';
-          html += '<td><div>' + escapeHTML(item.requested_model || item.upstream_model || '-') + '</div><div class="subtle">' + escapeHTML(item.upstream_model || '-') + '</div></td>';
-          html += '<td>' + escapeHTML(previewText(item.user_text_preview)) + '</td>';
-          html += '</tr>';
-        }
-        rowsNode.innerHTML = html;
-      }
-
-      function renderDetail() {
-        var item = selectedItem();
-        if (!item) {
-          detailHint.textContent = 'Select a row';
-          detailBody.innerHTML = '<div class="empty">Select a blocked request to inspect why the session was intercepted.</div>';
-          return;
-        }
-
-        state.selectedID = item.id;
-        detailHint.textContent = 'Event #' + item.id;
-
-        var imagesHTML = '<div class="subtle">None</div>';
-        if (Array.isArray(item.image_references) && item.image_references.length) {
-          imagesHTML = '<ul>';
-          for (var i = 0; i < item.image_references.length; i++) {
-            imagesHTML += '<li><code>' + escapeHTML(item.image_references[i]) + '</code></li>';
-          }
-          imagesHTML += '</ul>';
-        }
-
-        detailBody.innerHTML =
-          '<div class="detail-grid">' +
-            detailItem('Blocked at', formatTime(item.blocked_at)) +
-            detailItem('Session ID', item.session_id || '-') +
-            detailItem('Requested model', item.requested_model || '-') +
-            detailItem('Upstream model', item.upstream_model || '-') +
-            detailItem('Audit model', item.audit_model || '-') +
-            detailItem('Audit endpoint', item.audit_endpoint || '-') +
-            detailItem('Decision source', decisionLabel(item)) +
-            detailItem('Reason', item.reason || '-') +
-            detailItem('Block message', item.block_message || '-') +
-            detailItem('Audit error', item.audit_error || '-') +
-            detailItem('Source format', item.source_format || '-') +
-            detailItem('Request path', item.request_path || '-') +
-            detailItem('Message count', String(item.message_count || 0)) +
-            detailItem('Input hash', item.input_hash || '-') +
-          '</div>' +
-          '<div>' +
-            '<div class="subtle" style="margin-bottom:6px;">User text preview</div>' +
-            '<pre>' + escapeHTML(item.user_text_preview || '-') + '</pre>' +
-          '</div>' +
-          '<div>' +
-            '<div class="subtle" style="margin-bottom:6px;">Image references</div>' +
-            imagesHTML +
-          '</div>';
-      }
-
-      function detailItem(label, value) {
-        return '<div class="detail-item"><span class="label">' + escapeHTML(label) + '</span><div class="value">' + escapeHTML(value || '-') + '</div></div>';
-      }
-
-      async function load(reset) {
-        if (state.loading) {
-          return;
-        }
-        if (!currentManagementKey()) {
-          setStatus('Enter management key to load blocked events.', true);
-          return;
-        }
-        state.loading = true;
-        applyBtn.disabled = true;
-        refreshBtn.disabled = true;
-        loadMoreBtn.disabled = true;
-        setStatus(reset ? 'Loading...' : 'Loading older entries...', false);
-
-        try {
-          var response = await fetch(buildURL(reset), {
-            headers: {
-              'Accept': 'application/json',
-              'X-Management-Key': currentManagementKey()
-            }
-          });
-          var payload = await response.json();
-          if (!response.ok) {
-            throw new Error(payload && payload.error ? payload.error : 'request failed');
-          }
-
-          if (reset) {
-            state.items = Array.isArray(payload.items) ? payload.items : [];
-          } else if (Array.isArray(payload.items) && payload.items.length) {
-            state.items = state.items.concat(payload.items);
-          }
-
-          state.total = payload.total || 0;
-          state.hasMore = !!payload.has_more;
-          state.nextBeforeID = payload.next_before_id || 0;
-
-          if (!selectedItem() && state.items.length) {
-            state.selectedID = state.items[0].id;
-          }
-
-          renderRows();
-          renderDetail();
-
-          var loadedText = String(state.items.length) + ' loaded';
-          if (state.total) {
-            loadedText += ' / ' + String(state.total) + ' matched';
-          }
-          setStatus(loadedText, false);
-        } catch (error) {
-          setStatus(String(error && error.message ? error.message : error), true);
-        } finally {
-          state.loading = false;
-          applyBtn.disabled = false;
-          refreshBtn.disabled = false;
-          loadMoreBtn.disabled = !state.hasMore;
-        }
-      }
-
-      function syncFilterFromURL() {
-        var url = new URL(window.location.href);
-        try {
-          var savedKey = window.sessionStorage.getItem('risk-control-management-key');
-          if (savedKey) {
-            managementKeyInput.value = savedKey;
-          }
-        } catch (error) {
-        }
-        var sessionID = url.searchParams.get('session_id');
-        if (sessionID) {
-          sessionFilter.value = sessionID;
-        }
-        var limit = url.searchParams.get('limit');
-        if (limit) {
-          limitSelect.value = limit;
-        }
-      }
-
-      function persistManagementKey() {
-        try {
-          if (currentManagementKey()) {
-            window.sessionStorage.setItem('risk-control-management-key', currentManagementKey());
-          } else {
-            window.sessionStorage.removeItem('risk-control-management-key');
-          }
-        } catch (error) {
-        }
-      }
-
-      function updateURL() {
-        var url = new URL(window.location.href);
-        var sessionID = sessionFilter.value.trim();
-        if (sessionID) {
-          url.searchParams.set('session_id', sessionID);
-        } else {
-          url.searchParams.delete('session_id');
-        }
-        url.searchParams.set('limit', limitSelect.value);
-        window.history.replaceState({}, '', url.toString());
-      }
-
-      applyBtn.addEventListener('click', function () {
-        updateURL();
-        state.selectedID = 0;
-        load(true);
-      });
-      refreshBtn.addEventListener('click', function () {
-        updateURL();
-        load(true);
-      });
-      managementKeyInput.addEventListener('change', function () {
-        persistManagementKey();
-      });
-      managementKeyInput.addEventListener('blur', function () {
-        persistManagementKey();
-      });
-      loadMoreBtn.addEventListener('click', function () {
-        load(false);
-      });
-      sessionFilter.addEventListener('keydown', function (event) {
-        if (event.key === 'Enter') {
-          event.preventDefault();
-          updateURL();
-          state.selectedID = 0;
-          load(true);
-        }
-      });
-      rowsNode.addEventListener('click', function (event) {
-        var row = event.target.closest('tr[data-id]');
-        if (!row) {
-          return;
-        }
-        state.selectedID = Number(row.getAttribute('data-id'));
-        renderRows();
-        renderDetail();
-      });
-
-      syncFilterFromURL();
-      load(true);
-    }());
+    window.addEventListener('load', function() {
+      var savedKey = window.sessionStorage.getItem('risk-control-management-key');
+      if (savedKey) managementKeyEl.value = savedKey;
+    });
   </script>
 </body>
 </html>`

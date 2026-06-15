@@ -88,7 +88,7 @@ func ExtractFullUserInput(format sdktranslator.Format, payload []byte, maxRunes 
 		messages += collectResponsesUsers(gjson.GetBytes(payload, "input"), &parts, &images, maxImages)
 		messages += collectGeminiUsers(gjson.GetBytes(payload, "contents"), &parts, &images, maxImages)
 	}
-	text := truncateRunes(normalizeAuditText(strings.Join(parts, "\n")), maxRunes)
+	text := normalizeAuditText(strings.Join(parts, "\n\n"))
 	hash := sha256.Sum256([]byte(text + "\n" + strings.Join(images, "\n")))
 	return AuditInput{
 		Text:         text,
@@ -383,7 +383,7 @@ func addImageURLResult(images *[]string, value gjson.Result, maxImages int) {
 
 func addAuditText(parts *[]string, text string) {
 	text = strings.TrimSpace(text)
-	if text == "" || strings.HasPrefix(text, "<system-reminder>") {
+	if text == "" {
 		return
 	}
 	*parts = append(*parts, text)

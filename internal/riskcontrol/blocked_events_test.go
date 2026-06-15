@@ -54,7 +54,7 @@ func TestBlockEventStoreFiltersBySessionAndSanitizesPreview(t *testing.T) {
 	store := NewBlockEventStore(8)
 	store.RecordBlockedEvent(BlockEvent{
 		SessionID:       "execution:abc-123",
-		UserTextPreview: strings.Repeat("x", maxBlockedEventPreviewRunes+100),
+		UserTextPreview: strings.Repeat("x", 4096),
 		ImageReferences: []string{"img-1"},
 	})
 	store.RecordBlockedEvent(BlockEvent{SessionID: "conversation:def-456"})
@@ -66,8 +66,8 @@ func TestBlockEventStoreFiltersBySessionAndSanitizesPreview(t *testing.T) {
 	if page.Items[0].SessionID != "execution:abc-123" {
 		t.Fatalf("SessionID = %q, want execution:abc-123", page.Items[0].SessionID)
 	}
-	if !strings.Contains(page.Items[0].UserTextPreview, "[truncated]") {
-		t.Fatalf("UserTextPreview missing truncation marker: %q", page.Items[0].UserTextPreview)
+	if len(page.Items[0].UserTextPreview) != 4096 {
+		t.Fatalf("UserTextPreview length = %d, want 4096", len(page.Items[0].UserTextPreview))
 	}
 	if len(page.Items[0].ImageReferences) != 1 || page.Items[0].ImageReferences[0] != "img-1" {
 		t.Fatalf("ImageReferences = %#v, want preserved clone", page.Items[0].ImageReferences)
@@ -77,7 +77,7 @@ func TestBlockEventStoreFiltersBySessionAndSanitizesPreview(t *testing.T) {
 func TestBlockEventStorePersistsLatestEntriesOnly(t *testing.T) {
 	t.Parallel()
 
-	filePath := filepath.Join(t.TempDir(), "risk-control-blocks.json")
+	filePath := filepath.Join(t.TempDir(), "risk-control-blocks.jsonl")
 
 	writer := NewBlockEventStore(20)
 	if err := writer.ConfigurePersistence(filePath, 20); err != nil {

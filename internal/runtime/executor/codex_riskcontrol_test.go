@@ -29,7 +29,7 @@ func TestCodexExecutorRiskControlBlocksBeforeUpstream(t *testing.T) {
 			t.Fatalf("audit request missing valid internal bypass header")
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"action\":\"block\",\"policy_code\":\"malicious_cyber_or_system_compromise\",\"confidence\":\"high\",\"reason\":\"test block\"}"}}]}`))
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"malicious_cyber_abuse\",\"subcategory_code\":\"unauthorized_third_party_access\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"blocked prompt\"],\"reason\":\"test block\"}"}]}]}`))
 	}))
 	defer audit.Close()
 

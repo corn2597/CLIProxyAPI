@@ -16,6 +16,7 @@ const (
 	FailOpen   = "open"
 	FailClosed = "closed"
 
+	EndpointResponses       = "responses"
 	EndpointChatCompletions = "chat-completions"
 	EndpointModerations     = "moderations"
 
@@ -24,8 +25,9 @@ const (
 	defaultSessionAuditInterval = 5 * time.Minute
 	defaultSessionTTL           = 24 * time.Hour
 	defaultBlockedSessionTTL    = 7 * 24 * time.Hour
-	defaultMaxInputRunes        = 12000
-	defaultMaxInputImages       = 1
+	defaultBlockThreshold       = 0.97
+	defaultMaxInputRunes        = 0
+	defaultMaxInputImages       = 0
 	defaultBlockStatus          = http.StatusForbidden
 	defaultBlockMessage         = "risk control audit blocked this request"
 )
@@ -42,6 +44,7 @@ type settings struct {
 	sessionAuditInterval time.Duration
 	sessionTTL           time.Duration
 	blockedSessionTTL    time.Duration
+	blockThreshold       float64
 	maxInputRunes        int
 	maxInputImages       int
 	blockStatus          int
@@ -101,6 +104,11 @@ func normalizeSettings(cfg *config.Config) settings {
 		blockMessage = defaultBlockMessage
 	}
 
+	blockThreshold := raw.BlockThreshold
+	if blockThreshold <= 0 || blockThreshold > 1 {
+		blockThreshold = defaultBlockThreshold
+	}
+
 	maxRunes := raw.MaxInputRunes
 	if maxRunes <= 0 {
 		maxRunes = defaultMaxInputRunes
@@ -122,6 +130,7 @@ func normalizeSettings(cfg *config.Config) settings {
 		sessionAuditInterval: parsePositiveDuration(raw.SessionAuditInterval, defaultSessionAuditInterval),
 		sessionTTL:           parsePositiveDuration(raw.SessionTTL, defaultSessionTTL),
 		blockedSessionTTL:    parsePositiveDuration(raw.BlockedSessionTTL, defaultBlockedSessionTTL),
+		blockThreshold:       blockThreshold,
 		maxInputRunes:        maxRunes,
 		maxInputImages:       maxImages,
 		blockStatus:          blockStatus,
@@ -132,7 +141,9 @@ func normalizeSettings(cfg *config.Config) settings {
 func normalizeEndpoint(raw string) string {
 	value := strings.ToLower(strings.TrimSpace(raw))
 	switch value {
-	case "", "chat", "chat_completion", "chat-completions", "chat/completions", "/chat/completions":
+	case "", "responses", "response", "openai-responses", "/responses":
+		return EndpointResponses
+	case "chat", "chat_completion", "chat-completions", "chat/completions", "/chat/completions":
 		return EndpointChatCompletions
 	case "moderation", "moderations", "/moderations":
 		return EndpointModerations
@@ -140,7 +151,7 @@ func normalizeEndpoint(raw string) string {
 		if strings.HasPrefix(strings.TrimSpace(raw), "/") {
 			return strings.TrimSpace(raw)
 		}
-		return EndpointChatCompletions
+		return EndpointResponses
 	}
 }
 

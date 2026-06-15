@@ -754,6 +754,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 		mgmt.GET("/risk-control/blocks", s.mgmt.GetRiskControlBlocks)
+		mgmt.POST("/risk-control/blocks/:id/allow-once", s.mgmt.PostRiskControlAllowOnce)
+		mgmt.POST("/risk-control/blocks/:id/allow-session", s.mgmt.PostRiskControlAllowSession)
+		mgmt.POST("/risk-control/blocks/:id/confirm-block", s.mgmt.PostRiskControlConfirmBlock)
 		mgmt.GET("/risk-control/page", s.mgmt.GetRiskControlPage)
 	}
 }
@@ -909,13 +912,21 @@ func (s *Server) configureRiskControlBlockedEventStore(logDir string) {
 	if strings.TrimSpace(logDir) == "" {
 		return
 	}
-	filePath := filepath.Join(logDir, "risk-control-blocks.json")
-	if err := riskcontrol.DefaultBlockedEventStore().ConfigurePersistence(filePath, 20); err != nil {
+	filePath := filepath.Join(logDir, "risk-control-blocks.jsonl")
+	if err := riskcontrol.DefaultBlockedEventStore().ConfigurePersistence(filePath, 0); err != nil {
 		log.WithError(err).Warn("risk control: blocked-event store persistence configuration failed")
 	}
 	banFilePath := filepath.Join(logDir, "risk-control-session-bans.json")
 	if err := riskcontrol.ConfigureDefaultSessionBanStore(banFilePath); err != nil {
 		log.WithError(err).Warn("risk control: blocked-session persistence configuration failed")
+	}
+	overrideFilePath := filepath.Join(logDir, "risk-control-overrides.json")
+	if err := riskcontrol.ConfigureDefaultOverrideStore(overrideFilePath); err != nil {
+		log.WithError(err).Warn("risk control: override persistence configuration failed")
+	}
+	sampleFilePath := filepath.Join(logDir, "risk-control-samples.jsonl")
+	if err := riskcontrol.ConfigureDefaultSampleStore(sampleFilePath); err != nil {
+		log.WithError(err).Warn("risk control: sample persistence configuration failed")
 	}
 }
 

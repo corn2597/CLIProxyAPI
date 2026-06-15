@@ -11,10 +11,18 @@ const sessionCleanupInterval = 15 * time.Minute
 
 // Decision stores the latest audit outcome for a session.
 type Decision struct {
-	Audited bool
-	Blocked bool
-	Reason  string
-	Error   string
+	Audited           bool
+	Blocked           bool
+	Reason            string
+	Error             string
+	PolicyCode        string
+	SubcategoryCode   string
+	Confidence        float64
+	AuthorizedContext string
+	MaliciousIntent   bool
+	Evidence          []string
+	RawResponse       string
+	FailureClass      string
 }
 
 type sessionState struct {

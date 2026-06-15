@@ -50,7 +50,9 @@ type Handler struct {
 	postAuthHook        coreauth.PostAuthHook
 	postAuthPersistHook coreauth.PostAuthHook
 	pluginHost          *pluginhost.Host
-	riskBlockReader     riskcontrol.BlockEventReader
+	riskBlockStore      *riskcontrol.BlockEventStore
+	riskOverrideStore   *riskcontrol.OverrideStore
+	riskSampleStore     *riskcontrol.SampleStore
 }
 
 // NewHandler creates a new management handler instance.
@@ -66,7 +68,9 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
-		riskBlockReader:     riskcontrol.DefaultBlockedEventStore(),
+		riskBlockStore:      riskcontrol.DefaultBlockedEventStore(),
+		riskOverrideStore:   riskcontrol.DefaultOverrideStore(),
+		riskSampleStore:     riskcontrol.DefaultSampleStore(),
 	}
 	h.startAttemptCleanup()
 	return h

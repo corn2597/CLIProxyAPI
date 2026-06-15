@@ -275,7 +275,7 @@ type RiskControlConfig struct {
 	Mode string `yaml:"mode" json:"mode"`
 	// BaseURL is an OpenAI-compatible API base URL, usually ending in /v1.
 	BaseURL string `yaml:"base-url" json:"base-url"`
-	// Endpoint selects the OpenAI-compatible endpoint: "chat-completions" or "moderations".
+	// Endpoint selects the OpenAI-compatible endpoint. Default: "responses".
 	Endpoint string `yaml:"endpoint" json:"endpoint"`
 	// Model is the audit model sent to the configured API endpoint.
 	Model string `yaml:"model" json:"model"`
@@ -293,9 +293,11 @@ type RiskControlConfig struct {
 	SessionTTL string `yaml:"session-ttl" json:"session-ttl"`
 	// BlockedSessionTTL controls how long a blocked session ID remains banned. Default: 168h.
 	BlockedSessionTTL string `yaml:"blocked-session-ttl" json:"blocked-session-ttl"`
-	// MaxInputRunes limits text sent to the audit model. Default: 12000.
+	// BlockThreshold is the minimum structured confidence required to enforce a block.
+	BlockThreshold float64 `yaml:"block-threshold" json:"block-threshold"`
+	// MaxInputRunes is deprecated and ignored by risk control v2. Full user input is forwarded to audit.
 	MaxInputRunes int `yaml:"max-input-runes" json:"max-input-runes"`
-	// MaxInputImages limits image references summarized for audit. Default: 1.
+	// MaxInputImages is deprecated and ignored by risk control v2. All user image references are summarized.
 	MaxInputImages int `yaml:"max-input-images" json:"max-input-images"`
 	// BlockStatus is the downstream HTTP status for pre_block decisions. Default: 403.
 	BlockStatus int `yaml:"block-status" json:"block-status"`

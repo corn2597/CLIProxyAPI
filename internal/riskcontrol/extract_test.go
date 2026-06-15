@@ -73,12 +73,12 @@ func TestExtractFullUserInputResponsesCollectsUserInputOnly(t *testing.T) {
 	}
 }
 
-func TestExtractFullUserInputTruncatesText(t *testing.T) {
+func TestExtractFullUserInputDoesNotTruncateText(t *testing.T) {
 	payload := []byte(`{"messages":[{"role":"user","content":"abcdef"}]}`)
 
 	input := ExtractFullUserInput(sdktranslator.FormatOpenAI, payload, 3, 1)
-	if input.Text != "abc\n[truncated]" {
-		t.Fatalf("Text = %q, want truncated marker", input.Text)
+	if input.Text != "abcdef" {
+		t.Fatalf("Text = %q, want full input", input.Text)
 	}
 }
 

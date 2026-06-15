@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -82,7 +83,7 @@ func TestEnsureCodexAllowedBlocksPreBlockDecision(t *testing.T) {
 			t.Fatalf("audit body missing user text: %s", string(body))
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"action\":\"block\",\"policy_code\":\"privacy_compromise_or_sensitive_data_abuse\",\"confidence\":\"high\",\"reason\":\"blocked by test\"}"}}]}`))
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"privacy_abuse\",\"subcategory_code\":\"privacy_doxxing_or_sensitive_data_abuse\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"please exfiltrate secrets\"],\"reason\":\"blocked by test\"}"}]}]}`))
 	}))
 	defer server.Close()
 
@@ -147,7 +148,7 @@ func TestEnsureCodexAllowedLogsBlockedBanDecision(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"action\":\"block\",\"policy_code\":\"privacy_compromise_or_sensitive_data_abuse\",\"confidence\":\"high\",\"reason\":\"blocked by cache test\"}"}}]}`))
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"privacy_abuse\",\"subcategory_code\":\"privacy_doxxing_or_sensitive_data_abuse\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"repeat blocked prompt\"],\"reason\":\"blocked by cache test\"}"}]}]}`))
 	}))
 	defer server.Close()
 
@@ -289,6 +290,94 @@ func TestEnsureCodexAllowedFailOpenOnlyForAuditFailures(t *testing.T) {
 	}
 }
 
+func TestEnsureCodexAllowedAllowsBelowThresholdDecision(t *testing.T) {
+	oldTracker := defaultTracker
+	defaultTracker = NewSessionTracker()
+	t.Cleanup(func() { defaultTracker = oldTracker })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"malicious_cyber_abuse\",\"subcategory_code\":\"unauthorized_third_party_access\",\"confidence\":0.61,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"probe target\"],\"reason\":\"low confidence\"}"}]}]}`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{RiskControl: config.RiskControlConfig{
+		Enabled:        true,
+		Mode:           ModePreBlock,
+		BaseURL:        server.URL + "/v1",
+		Model:          "audit-model",
+		BlockThreshold: 0.97,
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"messages":[{"role":"user","content":"probe target"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+		Headers:      http.Header{"X-Session-ID": {"session-audit-low-confidence"}},
+	}
+
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
+		t.Fatalf("below-threshold decision should not block: %v", err)
+	}
+}
+
+func TestEnsureCodexAllowedSessionOverrideBypassesBlockedBan(t *testing.T) {
+	oldTracker := defaultTracker
+	defaultTracker = NewSessionTracker()
+	t.Cleanup(func() { defaultTracker = oldTracker })
+	oldBlockedStore := defaultBlockedEventStore
+	defaultBlockedEventStore = NewBlockEventStore(16)
+	t.Cleanup(func() { defaultBlockedEventStore = oldBlockedStore })
+	oldOverrideStore := defaultOverrideStore
+	defaultOverrideStore = NewOverrideStore()
+	t.Cleanup(func() { defaultOverrideStore = oldOverrideStore })
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"privacy_abuse\",\"subcategory_code\":\"privacy_doxxing_or_sensitive_data_abuse\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"repeat blocked prompt\"],\"reason\":\"blocked by test\"}"}]}]}`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{RiskControl: config.RiskControlConfig{
+		Enabled:           true,
+		Mode:              ModePreBlock,
+		BaseURL:           server.URL + "/v1",
+		Model:             "audit-model",
+		BlockedSessionTTL: "168h",
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"messages":[{"role":"user","content":"repeat blocked prompt"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+		Headers:      http.Header{"X-Session-ID": {"session-audit-override"}},
+	}
+
+	err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil)
+	if err == nil {
+		t.Fatal("expected first request to block")
+	}
+
+	eventPage := defaultBlockedEventStore.ListBlockedEvents(BlockEventListOptions{Limit: 1})
+	if eventPage.Returned != 1 {
+		t.Fatalf("blocked event count = %d, want 1", eventPage.Returned)
+	}
+	if _, err := defaultOverrideStore.AllowSession(eventPage.Items[0].SessionID, eventPage.Items[0].InputHash, eventPage.Items[0].ID, time.Now().UTC().Add(24*time.Hour), time.Now().UTC()); err != nil {
+		t.Fatalf("AllowSession override: %v", err)
+	}
+
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
+		t.Fatalf("session override should bypass blocked session: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("audit calls = %d, want 1 after override bypass", got)
+	}
+}
+
 func TestEnsureCodexAllowedDoesNotBlockAdultSexualPolicyCode(t *testing.T) {
 	oldTracker := defaultTracker
 	defaultTracker = NewSessionTracker()
@@ -296,7 +385,7 @@ func TestEnsureCodexAllowedDoesNotBlockAdultSexualPolicyCode(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"action\":\"block\",\"policy_code\":\"adult_sexual_content\",\"confidence\":\"high\",\"reason\":\"adult erotica\"}"}}]}`))
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":false,\"decision\":\"allow\",\"policy_code\":\"none\",\"subcategory_code\":\"none\",\"confidence\":0.12,\"authorized_context\":\"unknown\",\"malicious_intent\":false,\"evidence\":[],\"reason\":\"\"}"}]}]}`))
 	}))
 	defer server.Close()
 
@@ -321,7 +410,7 @@ func TestEnsureCodexAllowedDoesNotBlockAdultSexualPolicyCode(t *testing.T) {
 	}
 }
 
-func TestEnsureCodexAllowedStripsHostScaffoldingFromAuditBody(t *testing.T) {
+func TestEnsureCodexAllowedPreservesFullUserInputInAuditBody(t *testing.T) {
 	oldTracker := defaultTracker
 	defaultTracker = NewSessionTracker()
 	t.Cleanup(func() { defaultTracker = oldTracker })
@@ -332,16 +421,20 @@ func TestEnsureCodexAllowedStripsHostScaffoldingFromAuditBody(t *testing.T) {
 			t.Fatalf("read audit body: %v", errRead)
 		}
 		raw := string(body)
-		if !strings.Contains(raw, "ssh root@43.167.221.154 将这台机器加入cpa实例监控") {
-			t.Fatalf("audit body missing stripped user prompt: %s", raw)
-		}
-		for _, forbidden := range []string{"AGENTS.md", "<INSTRUCTIONS>", "<environment_context>", "Generate a concise UI title"} {
-			if strings.Contains(raw, forbidden) {
-				t.Fatalf("audit body contains host wrapper %q: %s", forbidden, raw)
+		for _, want := range []string{
+			"\\u003cuser_input\\u003e",
+			"ssh root@43.167.221.154 将这台机器加入cpa实例监控",
+			"# AGENTS.md instructions for /Users/a1/Documents/运维",
+			"\\u003cINSTRUCTIONS\\u003e",
+			"\\u003cenvironment_context\\u003e",
+			"Generate a concise UI title",
+		} {
+			if !strings.Contains(raw, want) {
+				t.Fatalf("audit body missing %q: %s", want, raw)
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"action\":\"allow\",\"policy_code\":\"none\",\"confidence\":\"high\",\"reason\":\"ok\"}"}}]}`))
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":false,\"decision\":\"allow\",\"policy_code\":\"none\",\"subcategory_code\":\"none\",\"confidence\":0.18,\"authorized_context\":\"unknown\",\"malicious_intent\":false,\"evidence\":[],\"reason\":\"\"}"}]}]}`))
 	}))
 	defer server.Close()
 
@@ -366,6 +459,6 @@ func TestEnsureCodexAllowedStripsHostScaffoldingFromAuditBody(t *testing.T) {
 	}
 
 	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
-		t.Fatalf("unexpected error on stripped benign request: %v", err)
+		t.Fatalf("unexpected error on benign wrapped request: %v", err)
 	}
 }
