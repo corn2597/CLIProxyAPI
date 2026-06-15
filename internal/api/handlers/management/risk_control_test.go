@@ -81,7 +81,17 @@ func TestGetRiskControlPageServesStandaloneHTML(t *testing.T) {
 		t.Fatalf("Content-Type = %q, want text/html", contentType)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"Risk Control Blocks", "/v0/management/risk-control/blocks", "Load older"} {
+	for _, want := range []string{
+		"Risk Control Blocks",
+		"/v0/management/risk-control/blocks",
+		"Load older",
+		"status-success",
+		"status-error",
+		"readResponsePayload",
+		"Allow session succeeded",
+		"Confirm block succeeded",
+		"Action failed for event",
+	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("page body missing %q", want)
 		}

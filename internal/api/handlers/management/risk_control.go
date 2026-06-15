@@ -330,6 +330,28 @@ const riskControlPageHTML = `<!DOCTYPE html>
     .status {
       min-height: 20px;
       color: var(--muted);
+      margin: 0 0 16px;
+    }
+    .status:not(:empty) {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: rgba(22, 27, 34, 0.92);
+    }
+    .status-success:not(:empty) {
+      border-color: rgba(63, 185, 80, 0.45);
+      background: rgba(63, 185, 80, 0.12);
+      color: var(--ok);
+    }
+    .status-error:not(:empty) {
+      border-color: rgba(255, 123, 114, 0.5);
+      background: rgba(255, 123, 114, 0.12);
+      color: var(--danger);
+    }
+    .status-pending:not(:empty) {
+      border-color: rgba(88, 166, 255, 0.45);
+      background: rgba(88, 166, 255, 0.12);
+      color: var(--accent);
     }
     @media (max-width: 1100px) {
       .toolbar, .layout { grid-template-columns: 1fr; }
@@ -359,7 +381,7 @@ const riskControlPageHTML = `<!DOCTYPE html>
       <button id="loadOlderBtn">Load older</button>
     </section>
 
-    <div class="status" id="status"></div>
+    <div class="status" id="status" role="status" aria-live="polite"></div>
 
     <section class="layout">
       <section class="panel">
@@ -457,9 +479,13 @@ const riskControlPageHTML = `<!DOCTYPE html>
       return (managementKeyEl.value || '').trim();
     }
 
-    function setStatus(message, isError) {
+    function setStatus(message, state) {
+      var tone = state === true ? 'error' : (state || 'neutral');
       statusEl.textContent = message || '';
-      statusEl.style.color = isError ? 'var(--danger)' : 'var(--muted)';
+      statusEl.className = 'status';
+      if (message) {
+        statusEl.classList.add('status-' + tone);
+      }
     }
 
     function headers() {
@@ -533,11 +559,11 @@ const riskControlPageHTML = `<!DOCTYPE html>
       params.set('limit', String(limit));
       if (append && nextBeforeID) params.set('before_id', String(nextBeforeID));
 
-      setStatus('Loading...');
+      setStatus('Loading...', 'pending');
       var resp = await fetch('/v0/management/risk-control/blocks?' + params.toString(), { headers: headers() });
-      var payload = await resp.json();
+      var payload = await readResponsePayload(resp);
       if (!resp.ok) {
-        throw new Error(payload.error || ('HTTP ' + resp.status));
+        throw new Error(responseErrorMessage(resp, payload));
       }
 
       nextBeforeID = payload.next_before_id || 0;
@@ -552,15 +578,57 @@ const riskControlPageHTML = `<!DOCTYPE html>
       setStatus('Loaded ' + (payload.returned || 0) + ' rows.');
     }
 
-    async function postAction(path, successMessage) {
-      if (!selected) return;
-      setStatus('Submitting...');
-      var resp = await fetch(path, { method: 'POST', headers: headers() });
-      var payload = await resp.json();
-      if (!resp.ok) {
-        throw new Error(payload.error || ('HTTP ' + resp.status));
+    async function readResponsePayload(resp) {
+      var text = await resp.text();
+      if (!text) return {};
+      try {
+        return JSON.parse(text);
+      } catch (_) {
+        return { _raw: text };
       }
-      setStatus(successMessage);
+    }
+
+    function responseErrorMessage(resp, payload) {
+      var detail = '';
+      if (payload) {
+        detail = payload.error || payload.message || payload.status || payload._raw || '';
+      }
+      detail = String(detail || '').trim();
+      return detail ? ('HTTP ' + resp.status + ': ' + detail) : ('HTTP ' + resp.status);
+    }
+
+    function setActionButtonsBusy(isBusy) {
+      allowOnceBtn.disabled = true;
+      allowSessionBtn.disabled = true;
+      confirmBlockBtn.disabled = true;
+      if (!isBusy) {
+        renderDetail();
+      }
+    }
+
+    async function postAction(path, successMessage) {
+      if (!selected) {
+        setStatus('Action failed: no event selected.', 'error');
+        return;
+      }
+      var eventID = selected.id;
+      setStatus('Submitting action for event #' + eventID + '...', 'pending');
+      setActionButtonsBusy(true);
+      try {
+        var resp = await fetch(path, { method: 'POST', headers: headers() });
+        var payload = await readResponsePayload(resp);
+        if (!resp.ok) {
+          setStatus('Action failed for event #' + eventID + ': ' + responseErrorMessage(resp, payload), 'error');
+          return;
+        }
+        var expires = payload && payload.override && payload.override.expires_at ? (' Expires at ' + payload.override.expires_at + '.') : '';
+        setStatus(successMessage + ' Event #' + eventID + '.' + expires, 'success');
+      } catch (err) {
+        var message = err && err.message ? err.message : String(err);
+        setStatus('Action failed for event #' + eventID + ': ' + message, 'error');
+      } finally {
+        setActionButtonsBusy(false);
+      }
     }
 
     rowsEl.addEventListener('click', function(event) {
@@ -583,18 +651,15 @@ const riskControlPageHTML = `<!DOCTYPE html>
     });
 
     allowOnceBtn.addEventListener('click', function() {
-      postAction('/v0/management/risk-control/blocks/' + selected.id + '/allow-once', 'Allow-once override created and sample labeled.')
-        .catch(function(err) { setStatus(err.message, true); });
+      postAction('/v0/management/risk-control/blocks/' + selected.id + '/allow-once', 'Allow once succeeded; API call completed.');
     });
 
     allowSessionBtn.addEventListener('click', function() {
-      postAction('/v0/management/risk-control/blocks/' + selected.id + '/allow-session', 'Session override created and sample labeled.')
-        .catch(function(err) { setStatus(err.message, true); });
+      postAction('/v0/management/risk-control/blocks/' + selected.id + '/allow-session', 'Allow session succeeded; API call completed.');
     });
 
     confirmBlockBtn.addEventListener('click', function() {
-      postAction('/v0/management/risk-control/blocks/' + selected.id + '/confirm-block', 'Block sample confirmed.')
-        .catch(function(err) { setStatus(err.message, true); });
+      postAction('/v0/management/risk-control/blocks/' + selected.id + '/confirm-block', 'Confirm block succeeded; API call completed.');
     });
 
     window.addEventListener('load', function() {
