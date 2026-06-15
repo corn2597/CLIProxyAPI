@@ -389,6 +389,7 @@ const riskControlPageHTML = `<!DOCTYPE html>
     }
     .actions {
       display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
       gap: 10px;
     }
     .status {
@@ -483,6 +484,14 @@ const riskControlPageHTML = `<!DOCTYPE html>
           <div id="selectedID" class="subtle">none</div>
         </div>
         <div class="detail">
+          <div class="actions" aria-label="Selected event actions">
+            <button id="allowOnceBtn" class="ok" disabled>Allow once</button>
+            <button id="allowSessionBtn" class="primary" disabled>Allow session</button>
+            <button id="confirmBlockBtn" class="warn" disabled>Confirm block</button>
+            <button id="observeAllowBtn" class="ok hidden" disabled>ALLOW</button>
+            <button id="observeBlockBtn" class="warn hidden" disabled>BLOCK</button>
+          </div>
+
           <div class="detail-grid">
             <div><strong>Session ID</strong><div id="detailSession">-</div></div>
             <div><strong>Decision source</strong><div id="detailDecisionSource">-</div></div>
@@ -505,14 +514,6 @@ const riskControlPageHTML = `<!DOCTYPE html>
           <div class="section">
             <strong>Raw audit response</strong>
             <pre id="detailRaw">-</pre>
-          </div>
-
-          <div class="actions">
-            <button id="allowOnceBtn" class="ok" disabled>Allow once</button>
-            <button id="allowSessionBtn" class="primary" disabled>Allow session</button>
-            <button id="confirmBlockBtn" class="warn" disabled>Confirm block</button>
-            <button id="observeAllowBtn" class="ok hidden" disabled>ALLOW</button>
-            <button id="observeBlockBtn" class="warn hidden" disabled>BLOCK</button>
           </div>
         </div>
       </aside>
