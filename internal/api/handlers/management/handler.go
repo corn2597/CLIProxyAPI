@@ -54,6 +54,7 @@ type Handler struct {
 	riskObserveStore    *riskcontrol.BlockEventStore
 	riskOverrideStore   *riskcontrol.OverrideStore
 	riskSampleStore     *riskcontrol.SampleStore
+	riskAuditLogStore   *riskcontrol.AuditLogStore
 }
 
 // NewHandler creates a new management handler instance.
@@ -73,6 +74,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		riskObserveStore:    riskcontrol.DefaultObserveEventStore(),
 		riskOverrideStore:   riskcontrol.DefaultOverrideStore(),
 		riskSampleStore:     riskcontrol.DefaultSampleStore(),
+		riskAuditLogStore:   riskcontrol.DefaultAuditLogStore(),
 	}
 	h.startAttemptCleanup()
 	return h

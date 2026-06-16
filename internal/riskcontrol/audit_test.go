@@ -382,6 +382,56 @@ func TestEnsureCodexAllowedAllowsBelowThresholdDecision(t *testing.T) {
 	}
 }
 
+func TestEnsureCodexAllowedRecordsFreshAuditLogOnlyOnce(t *testing.T) {
+	oldTracker := defaultTracker
+	defaultTracker = NewSessionTracker()
+	t.Cleanup(func() { defaultTracker = oldTracker })
+	oldAuditLogStore := defaultAuditLogStore
+	defaultAuditLogStore = NewAuditLogStore(64 * 1024)
+	t.Cleanup(func() { defaultAuditLogStore = oldAuditLogStore })
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":false,\"decision\":\"allow\",\"policy_code\":\"none\",\"subcategory_code\":\"none\",\"confidence\":0.1,\"authorized_context\":\"unknown\",\"malicious_intent\":false,\"evidence\":[],\"reason\":\"\"}"}]}]}`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{RiskControl: config.RiskControlConfig{
+		Enabled:              true,
+		Mode:                 ModePreBlock,
+		BaseURL:              server.URL + "/v1",
+		Model:                "audit-model",
+		SessionAuditInterval: "5m",
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hello"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+		Headers:      http.Header{"X-Session-ID": {"session-audit-log-once"}},
+	}
+
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
+		t.Fatalf("first audit returned error: %v", err)
+	}
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
+		t.Fatalf("cached audit returned error: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("audit calls = %d, want 1", got)
+	}
+	page := defaultAuditLogStore.ListAuditLogs(AuditLogListOptions{Limit: 10})
+	if page.Returned != 1 {
+		t.Fatalf("audit log count = %d, want 1", page.Returned)
+	}
+	if page.Items[0].Decision != "allow" || page.Items[0].SessionID != "header:session-audit-log-once" {
+		t.Fatalf("audit log item = %#v, want allow log for session", page.Items[0])
+	}
+}
+
 func TestEnsureCodexAllowedAllowsBelowDefaultHighPrecisionThreshold(t *testing.T) {
 	oldTracker := defaultTracker
 	defaultTracker = NewSessionTracker()
@@ -389,7 +439,7 @@ func TestEnsureCodexAllowedAllowsBelowDefaultHighPrecisionThreshold(t *testing.T
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"malicious_cyber_abuse\",\"subcategory_code\":\"captcha_bypass_or_credential_attack\",\"confidence\":0.98,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"bypass captcha\"],\"reason\":\"below default threshold\"}"}]}]}`))
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"malicious_cyber_abuse\",\"subcategory_code\":\"captcha_bypass_or_credential_attack\",\"confidence\":0.96,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"bypass captcha\"],\"reason\":\"below default threshold\"}"}]}]}`))
 	}))
 	defer server.Close()
 
@@ -409,7 +459,41 @@ func TestEnsureCodexAllowedAllowsBelowDefaultHighPrecisionThreshold(t *testing.T
 	}
 
 	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
-		t.Fatalf("0.98 decision should not block with default 0.99 threshold: %v", err)
+		t.Fatalf("0.96 decision should not block with default 0.97 threshold: %v", err)
+	}
+}
+
+func TestEnsureCodexAllowedBlocksAtDefaultHighPrecisionThreshold(t *testing.T) {
+	oldTracker := defaultTracker
+	defaultTracker = NewSessionTracker()
+	t.Cleanup(func() { defaultTracker = oldTracker })
+	oldBlockedStore := defaultBlockedEventStore
+	defaultBlockedEventStore = NewBlockEventStore(16)
+	t.Cleanup(func() { defaultBlockedEventStore = oldBlockedStore })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"malicious_cyber_abuse\",\"subcategory_code\":\"captcha_bypass_or_credential_attack\",\"confidence\":0.97,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"bypass captcha\"],\"reason\":\"at default threshold\"}"}]}]}`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{RiskControl: config.RiskControlConfig{
+		Enabled: true,
+		Mode:    ModePreBlock,
+		BaseURL: server.URL + "/v1",
+		Model:   "audit-model",
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"messages":[{"role":"user","content":"bypass captcha"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+		Headers:      http.Header{"X-Session-ID": {"session-audit-default-threshold-block"}},
+	}
+
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err == nil {
+		t.Fatal("0.97 decision should block with default 0.97 threshold")
 	}
 }
 
@@ -704,5 +788,19 @@ func TestEnsureCodexAllowedPreservesFullUserInputInAuditBody(t *testing.T) {
 
 	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
 		t.Fatalf("unexpected error on benign wrapped request: %v", err)
+	}
+}
+
+func TestDefaultAuditPromptHardBlocksThirdPartyCommercialAppReverse(t *testing.T) {
+	prompt := defaultAuditPrompt()
+	for _, want := range []string{
+		"逆向抖音app",
+		"真实第三方闭源商业",
+		"reverse_cracking_or_drm_bypass",
+		"自己的 App、公司授权测试、开源 APK、CTF/靶场、教学 demo",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("default audit prompt missing %q", want)
+		}
 	}
 }

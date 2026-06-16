@@ -16,8 +16,8 @@ func TestNormalizeSettingsDefaultsBlockThresholdToHighPrecision(t *testing.T) {
 		Model:   "audit-model",
 	}})
 
-	if settings.blockThreshold != 0.99 {
-		t.Fatalf("blockThreshold = %v, want 0.99", settings.blockThreshold)
+	if settings.blockThreshold != 0.97 {
+		t.Fatalf("blockThreshold = %v, want 0.97", settings.blockThreshold)
 	}
 }
 
@@ -29,7 +29,23 @@ func TestNormalizeSettingsClampsLowBlockThresholdToHighPrecision(t *testing.T) {
 		Mode:           ModePreBlock,
 		BaseURL:        "http://audit.local/v1",
 		Model:          "audit-model",
-		BlockThreshold: 0.97,
+		BlockThreshold: 0.96,
+	}})
+
+	if settings.blockThreshold != 0.97 {
+		t.Fatalf("blockThreshold = %v, want 0.97", settings.blockThreshold)
+	}
+}
+
+func TestNormalizeSettingsKeepsHigherBlockThreshold(t *testing.T) {
+	t.Parallel()
+
+	settings := normalizeSettings(&config.Config{RiskControl: config.RiskControlConfig{
+		Enabled:        true,
+		Mode:           ModePreBlock,
+		BaseURL:        "http://audit.local/v1",
+		Model:          "audit-model",
+		BlockThreshold: 0.99,
 	}})
 
 	if settings.blockThreshold != 0.99 {

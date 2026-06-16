@@ -1,6 +1,7 @@
 package management
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -21,6 +22,37 @@ func (h *Handler) GetRiskControlObservations(c *gin.Context) {
 	h.listRiskControlEvents(c, h.riskObserveEvents(), "risk control observe log unavailable")
 }
 
+// GetRiskControlLogs lists every fresh audit call recorded by risk control.
+func (h *Handler) GetRiskControlLogs(c *gin.Context) {
+	store := h.riskAuditLogs()
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "risk control audit log unavailable"})
+		return
+	}
+
+	limit, errLimit := parseLimit(c.Query("limit"))
+	if errLimit != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid limit: %v", errLimit)})
+		return
+	}
+
+	beforeID, errBeforeID := parseUintQuery(c.Query("before_id"))
+	if errBeforeID != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid before_id: %v", errBeforeID)})
+		return
+	}
+
+	page := store.ListAuditLogs(riskcontrol.AuditLogListOptions{
+		SessionID:  c.Query("session_id"),
+		Decision:   c.Query("decision"),
+		PolicyCode: c.Query("policy_code"),
+		InputHash:  c.Query("input_hash"),
+		BeforeID:   beforeID,
+		Limit:      limit,
+	})
+	c.JSON(http.StatusOK, page)
+}
+
 // PostRiskControlAllowOnce creates an input-hash-based allow-once override and labels a should_allow sample.
 func (h *Handler) PostRiskControlAllowOnce(c *gin.Context) {
 	event, ok := h.lookupRiskControlEvent(c)
@@ -32,17 +64,17 @@ func (h *Handler) PostRiskControlAllowOnce(c *gin.Context) {
 		return
 	}
 	now := time.Now().UTC()
+	sample, deduped, err := h.upsertRiskSample(event, riskcontrol.SampleShouldAllow, riskcontrol.OverrideAllowOnce, now)
+	if err != nil {
+		h.writeRiskSampleError(c, err)
+		return
+	}
 	override, err := h.riskOverrides().AllowOnce(event.InputHash, event.SessionID, event.ID, now)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	sample, err := h.riskSamples().Append(riskcontrol.NewSampleRecordFromBlockEvent(event, riskcontrol.SampleShouldAllow, riskcontrol.OverrideAllowOnce, now))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"override": override, "sample": sample})
+	c.JSON(http.StatusOK, gin.H{"override": override, "sample": sample, "deduped": deduped})
 }
 
 // PostRiskControlAllowSession creates a session-scoped allow override and labels a should_allow sample.
@@ -56,17 +88,17 @@ func (h *Handler) PostRiskControlAllowSession(c *gin.Context) {
 		return
 	}
 	now := time.Now().UTC()
+	sample, deduped, err := h.upsertRiskSample(event, riskcontrol.SampleShouldAllow, riskcontrol.OverrideAllowSession, now)
+	if err != nil {
+		h.writeRiskSampleError(c, err)
+		return
+	}
 	override, err := h.riskOverrides().AllowSession(event.SessionID, event.InputHash, event.ID, now.Add(h.sessionOverrideTTL()), now)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	sample, err := h.riskSamples().Append(riskcontrol.NewSampleRecordFromBlockEvent(event, riskcontrol.SampleShouldAllow, riskcontrol.OverrideAllowSession, now))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"override": override, "sample": sample})
+	c.JSON(http.StatusOK, gin.H{"override": override, "sample": sample, "deduped": deduped})
 }
 
 // PostRiskControlConfirmBlock labels a blocked event as a correct should_block sample.
@@ -75,12 +107,12 @@ func (h *Handler) PostRiskControlConfirmBlock(c *gin.Context) {
 	if !ok {
 		return
 	}
-	sample, err := h.riskSamples().Append(riskcontrol.NewSampleRecordFromBlockEvent(event, riskcontrol.SampleShouldBlock, "confirm_block", time.Now().UTC()))
+	sample, deduped, err := h.upsertRiskSample(event, riskcontrol.SampleShouldBlock, "confirm_block", time.Now().UTC())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		h.writeRiskSampleError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"sample": sample})
+	c.JSON(http.StatusOK, gin.H{"sample": sample, "deduped": deduped})
 }
 
 // PostRiskControlObservationAllow labels an observe-only event as a should_allow sample.
@@ -89,12 +121,12 @@ func (h *Handler) PostRiskControlObservationAllow(c *gin.Context) {
 	if !ok {
 		return
 	}
-	sample, err := h.riskSamples().Append(riskcontrol.NewSampleRecordFromBlockEvent(event, riskcontrol.SampleShouldAllow, "observe_allow", time.Now().UTC()))
+	sample, deduped, err := h.upsertRiskSample(event, riskcontrol.SampleShouldAllow, "observe_allow", time.Now().UTC())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		h.writeRiskSampleError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"sample": sample})
+	c.JSON(http.StatusOK, gin.H{"sample": sample, "deduped": deduped})
 }
 
 // PostRiskControlObservationBlock labels an observe-only event as a should_block sample.
@@ -103,12 +135,12 @@ func (h *Handler) PostRiskControlObservationBlock(c *gin.Context) {
 	if !ok {
 		return
 	}
-	sample, err := h.riskSamples().Append(riskcontrol.NewSampleRecordFromBlockEvent(event, riskcontrol.SampleShouldBlock, "observe_block", time.Now().UTC()))
+	sample, deduped, err := h.upsertRiskSample(event, riskcontrol.SampleShouldBlock, "observe_block", time.Now().UTC())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		h.writeRiskSampleError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"sample": sample})
+	c.JSON(http.StatusOK, gin.H{"sample": sample, "deduped": deduped})
 }
 
 // GetRiskControlPage serves a standalone management page for blocked-session inspection.
@@ -140,7 +172,34 @@ func (h *Handler) listRiskControlEvents(c *gin.Context, store *riskcontrol.Block
 		BeforeID:  beforeID,
 		Limit:     limit,
 	})
+	if samples := h.riskSamples(); samples != nil && len(page.Items) > 0 {
+		items, err := samples.AnnotateBlockEvents(page.Items)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("risk control sample status unavailable: %v", err)})
+			return
+		}
+		page.Items = items
+	}
 	c.JSON(http.StatusOK, page)
+}
+
+func (h *Handler) upsertRiskSample(event riskcontrol.BlockEvent, label string, action string, now time.Time) (riskcontrol.SampleRecord, bool, error) {
+	return h.riskSamples().Upsert(riskcontrol.NewSampleRecordFromBlockEvent(event, label, action, now))
+}
+
+func (h *Handler) writeRiskSampleError(c *gin.Context, err error) {
+	var conflict *riskcontrol.SampleLabelConflictError
+	if errors.As(err, &conflict) {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":        err.Error(),
+			"sample_key":   conflict.SampleKey,
+			"existing":     conflict.Existing,
+			"incoming":     conflict.Incoming,
+			"label_status": riskcontrol.SampleLabelStatusConflict,
+		})
+		return
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 }
 
 func (h *Handler) lookupRiskControlEvent(c *gin.Context) (riskcontrol.BlockEvent, bool) {
@@ -195,6 +254,13 @@ func (h *Handler) riskSamples() *riskcontrol.SampleStore {
 		return h.riskSampleStore
 	}
 	return riskcontrol.DefaultSampleStore()
+}
+
+func (h *Handler) riskAuditLogs() *riskcontrol.AuditLogStore {
+	if h != nil && h.riskAuditLogStore != nil {
+		return h.riskAuditLogStore
+	}
+	return riskcontrol.DefaultAuditLogStore()
 }
 
 func (h *Handler) sessionOverrideTTL() time.Duration {
@@ -265,7 +331,7 @@ const riskControlPageHTML = `<!DOCTYPE html>
     }
     .toolbar {
       display: grid;
-      grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) minmax(180px, 1.4fr) auto auto;
+      grid-template-columns: minmax(180px, 1fr) minmax(110px, 0.7fr) minmax(150px, 0.8fr) minmax(180px, 1.4fr) auto auto;
       gap: 12px;
       align-items: end;
       padding: 16px;
@@ -293,7 +359,7 @@ const riskControlPageHTML = `<!DOCTYPE html>
       color: var(--muted);
       font-size: 12px;
     }
-    input, button, textarea {
+    input, button, textarea, select {
       border: 1px solid var(--border);
       background: #0f141a;
       color: var(--text);
@@ -439,6 +505,17 @@ const riskControlPageHTML = `<!DOCTYPE html>
         <input id="limit" type="number" value="20" min="1" max="100">
       </div>
       <div class="field">
+        <label for="labelStatusFilter">Label status</label>
+        <select id="labelStatusFilter">
+          <option value="all">All</option>
+          <option value="unlabeled">Unlabeled</option>
+          <option value="labeled">Labeled</option>
+          <option value="allow">ALLOW</option>
+          <option value="block">BLOCK</option>
+          <option value="conflict">Conflict</option>
+        </select>
+      </div>
+      <div class="field">
         <label for="managementKey">Management key</label>
         <input id="managementKey" type="password" placeholder="Bearer or X-Management-Key">
       </div>
@@ -451,6 +528,7 @@ const riskControlPageHTML = `<!DOCTYPE html>
     <div class="tabs" role="tablist" aria-label="Risk control event type">
       <button id="blockedTabBtn" class="tab-button active" role="tab" aria-selected="true">Blocked</button>
       <button id="observeTabBtn" class="tab-button" role="tab" aria-selected="false">Observe</button>
+      <button id="logsTabBtn" class="tab-button" role="tab" aria-selected="false">Logs</button>
     </div>
 
     <section class="layout">
@@ -465,6 +543,7 @@ const riskControlPageHTML = `<!DOCTYPE html>
               <tr>
                 <th>ID</th>
                 <th id="timeHeader">Blocked At</th>
+                <th>Label</th>
                 <th>Session</th>
                 <th>Policy</th>
                 <th>Confidence</th>
@@ -472,7 +551,7 @@ const riskControlPageHTML = `<!DOCTYPE html>
               </tr>
             </thead>
             <tbody id="rows">
-              <tr><td colspan="6" class="subtle">No data loaded yet.</td></tr>
+              <tr><td colspan="7" class="subtle">No data loaded yet.</td></tr>
             </tbody>
           </table>
         </div>
@@ -537,6 +616,7 @@ const riskControlPageHTML = `<!DOCTYPE html>
     var managementKeyEl = document.getElementById('managementKey');
     var sessionFilterEl = document.getElementById('sessionFilter');
     var limitEl = document.getElementById('limit');
+    var labelStatusFilterEl = document.getElementById('labelStatusFilter');
     var allowOnceBtn = document.getElementById('allowOnceBtn');
     var allowSessionBtn = document.getElementById('allowSessionBtn');
     var confirmBlockBtn = document.getElementById('confirmBlockBtn');
@@ -545,6 +625,7 @@ const riskControlPageHTML = `<!DOCTYPE html>
     var loadOlderBtn = document.getElementById('loadOlderBtn');
     var blockedTabBtn = document.getElementById('blockedTabBtn');
     var observeTabBtn = document.getElementById('observeTabBtn');
+    var logsTabBtn = document.getElementById('logsTabBtn');
     var tableTitleEl = document.getElementById('tableTitle');
     var timeHeaderEl = document.getElementById('timeHeader');
 
@@ -578,14 +659,16 @@ const riskControlPageHTML = `<!DOCTYPE html>
     }
 
     function renderRows() {
-      if (!items.length) {
-        rowsEl.innerHTML = '<tr><td colspan="6" class="subtle">No events matched.</td></tr>';
+      var visibleItems = filteredItems();
+      if (!visibleItems.length) {
+        rowsEl.innerHTML = '<tr><td colspan="7" class="subtle">No events matched.</td></tr>';
       } else {
-        rowsEl.innerHTML = items.map(function(item) {
+        rowsEl.innerHTML = visibleItems.map(function(item) {
           var selectedClass = selected && selected.id === item.id ? ' class="selected"' : '';
           return '<tr data-id="' + item.id + '"' + selectedClass + '>' +
             '<td>' + item.id + '</td>' +
-            '<td>' + escapeHTML(item.observed_at || item.blocked_at || '') + '</td>' +
+            '<td>' + escapeHTML(item.audited_at || item.observed_at || item.blocked_at || '') + '</td>' +
+            '<td>' + renderStatusChip(item) + '</td>' +
             '<td>' + escapeHTML(item.session_id || '') + '</td>' +
             '<td>' + escapeHTML(item.policy_code || '-') + '</td>' +
             '<td>' + escapeHTML(formatConfidence(item.confidence)) + '</td>' +
@@ -593,7 +676,7 @@ const riskControlPageHTML = `<!DOCTYPE html>
           '</tr>';
         }).join('');
       }
-      countLabelEl.textContent = items.length + ' rows';
+      countLabelEl.textContent = visibleItems.length + '/' + items.length + ' rows';
       loadOlderBtn.disabled = !hasMore;
     }
 
@@ -610,14 +693,18 @@ const riskControlPageHTML = `<!DOCTYPE html>
       detailInputEl.textContent = item ? (item.user_text_preview || '-') : '-';
       detailRawEl.textContent = item ? (item.raw_audit_response || '-') : '-';
       var isObserve = activeView === 'observe';
+      var isLogs = activeView === 'logs';
       allowOnceBtn.classList.toggle('hidden', isObserve);
       allowSessionBtn.classList.toggle('hidden', isObserve);
       confirmBlockBtn.classList.toggle('hidden', isObserve);
+      allowOnceBtn.classList.toggle('hidden', isLogs);
+      allowSessionBtn.classList.toggle('hidden', isLogs);
+      confirmBlockBtn.classList.toggle('hidden', isLogs);
       observeAllowBtn.classList.toggle('hidden', !isObserve);
       observeBlockBtn.classList.toggle('hidden', !isObserve);
-      allowOnceBtn.disabled = isObserve || !item || !item.input_hash;
-      allowSessionBtn.disabled = isObserve || !item || !item.session_id;
-      confirmBlockBtn.disabled = isObserve || !item;
+      allowOnceBtn.disabled = isObserve || isLogs || !item || !item.input_hash;
+      allowSessionBtn.disabled = isObserve || isLogs || !item || !item.session_id;
+      confirmBlockBtn.disabled = isObserve || isLogs || !item;
       observeAllowBtn.disabled = !isObserve || !item;
       observeBlockBtn.disabled = !isObserve || !item;
       renderRows();
@@ -646,7 +733,7 @@ const riskControlPageHTML = `<!DOCTYPE html>
       params.set('limit', String(limit));
       if (append && nextBeforeID) params.set('before_id', String(nextBeforeID));
 
-      var endpoint = activeView === 'observe' ? '/v0/management/risk-control/observations' : '/v0/management/risk-control/blocks';
+      var endpoint = activeView === 'logs' ? '/v0/management/risk-control/logs' : (activeView === 'observe' ? '/v0/management/risk-control/observations' : '/v0/management/risk-control/blocks');
       setStatus('Loading ' + activeView + ' events...', 'pending');
       var resp = await fetch(endpoint + '?' + params.toString(), { headers: headers() });
       var payload = await readResponsePayload(resp);
@@ -663,7 +750,8 @@ const riskControlPageHTML = `<!DOCTYPE html>
         selected = items.find(function(item) { return item.id === selected.id; }) || null;
       }
       renderDetail();
-      setStatus('Loaded ' + (payload.returned || 0) + ' rows.');
+      var sizeText = activeView === 'logs' && payload.max_bytes ? (' Log size ' + formatBytes(payload.current_bytes || 0) + '/' + formatBytes(payload.max_bytes) + '.') : '';
+      setStatus('Loaded ' + (payload.returned || 0) + ' rows.' + sizeText);
     }
 
     function switchView(view) {
@@ -674,13 +762,60 @@ const riskControlPageHTML = `<!DOCTYPE html>
       items = [];
       blockedTabBtn.classList.toggle('active', view === 'blocks');
       observeTabBtn.classList.toggle('active', view === 'observe');
+      logsTabBtn.classList.toggle('active', view === 'logs');
       blockedTabBtn.setAttribute('aria-selected', view === 'blocks' ? 'true' : 'false');
       observeTabBtn.setAttribute('aria-selected', view === 'observe' ? 'true' : 'false');
-      tableTitleEl.textContent = view === 'observe' ? 'Observe-only audit events' : 'Recent blocked events';
-      timeHeaderEl.textContent = view === 'observe' ? 'Observed At' : 'Blocked At';
-      rowsEl.innerHTML = '<tr><td colspan="6" class="subtle">No data loaded yet.</td></tr>';
+      logsTabBtn.setAttribute('aria-selected', view === 'logs' ? 'true' : 'false');
+      tableTitleEl.textContent = view === 'logs' ? 'Audit logs' : (view === 'observe' ? 'Observe-only audit events' : 'Recent blocked events');
+      timeHeaderEl.textContent = view === 'logs' ? 'Audited At' : (view === 'observe' ? 'Observed At' : 'Blocked At');
+      rowsEl.innerHTML = '<tr><td colspan="7" class="subtle">No data loaded yet.</td></tr>';
       renderDetail();
       loadBlocks(false).catch(function(err) { setStatus(err.message, true); });
+    }
+
+    function filteredItems() {
+      var filter = labelStatusFilterEl.value || 'all';
+      if (filter === 'all') return items;
+      if (activeView === 'logs') {
+        return items.filter(function(item) {
+          var decision = (item && item.decision) ? item.decision : 'allow';
+          if (filter === 'labeled') return decision !== 'allow';
+          if (filter === 'unlabeled') return decision === 'allow';
+          return decision === filter;
+        });
+      }
+      return items.filter(function(item) {
+        var status = itemLabelStatus(item);
+        if (filter === 'labeled') return status !== 'unlabeled';
+        return status === filter;
+      });
+    }
+
+    function itemLabelStatus(item) {
+      return (item && item.label_status) ? item.label_status : 'unlabeled';
+    }
+
+    function renderStatusChip(item) {
+      if (activeView === 'logs') {
+        var decision = (item && item.decision) ? item.decision : 'allow';
+        var decisionCls = '';
+        if (decision === 'allow') decisionCls = ' ok';
+        if (decision === 'block' || decision === 'error') decisionCls = ' warn';
+        return '<span class="chip' + decisionCls + '">' + escapeHTML(decision.toUpperCase()) + '</span>';
+      }
+      var status = itemLabelStatus(item);
+      var label = status.toUpperCase();
+      var cls = '';
+      if (status === 'allow') cls = ' ok';
+      if (status === 'block' || status === 'conflict') cls = ' warn';
+      return '<span class="chip' + cls + '">' + escapeHTML(label) + '</span>';
+    }
+
+    function formatBytes(value) {
+      value = Number(value || 0);
+      if (value >= 1024 * 1024) return (value / 1024 / 1024).toFixed(1) + ' MB';
+      if (value >= 1024) return (value / 1024).toFixed(1) + ' KB';
+      return value + ' B';
     }
 
     async function readResponsePayload(resp) {
@@ -728,14 +863,34 @@ const riskControlPageHTML = `<!DOCTYPE html>
           setStatus('Action failed for event #' + eventID + ': ' + responseErrorMessage(resp, payload), 'error');
           return;
         }
+        if (payload && payload.sample) {
+          applySampleToSelected(payload.sample);
+        }
         var expires = payload && payload.override && payload.override.expires_at ? (' Expires at ' + payload.override.expires_at + '.') : '';
-        setStatus(successMessage + ' Event #' + eventID + '.' + expires, 'success');
+        var deduped = payload && payload.deduped ? ' Existing sample reused; no duplicate sample was written.' : '';
+        setStatus(successMessage + ' Event #' + eventID + '.' + expires + deduped, 'success');
       } catch (err) {
         var message = err && err.message ? err.message : String(err);
         setStatus('Action failed for event #' + eventID + ': ' + message, 'error');
       } finally {
         setActionButtonsBusy(false);
       }
+    }
+
+    function applySampleToSelected(sample) {
+      if (!selected || !sample) return;
+      var status = sample.label === 'should_allow' ? 'allow' : (sample.label === 'should_block' ? 'block' : sample.label);
+      selected.label_status = status || 'unlabeled';
+      selected.sample_id = sample.id || 0;
+      selected.sample_key = sample.sample_key || selected.sample_key || '';
+      selected.sample_label = sample.label || '';
+      selected.sample_action = sample.action || '';
+      selected.sample_labeled_at = sample.labeled_at || '';
+      selected.sample_conflict = false;
+      items = items.map(function(item) {
+        return item.id === selected.id ? selected : item;
+      });
+      renderRows();
     }
 
     rowsEl.addEventListener('click', function(event) {
@@ -755,6 +910,10 @@ const riskControlPageHTML = `<!DOCTYPE html>
 
     loadOlderBtn.addEventListener('click', function() {
       loadBlocks(true).catch(function(err) { setStatus(err.message, true); });
+    });
+
+    labelStatusFilterEl.addEventListener('change', function() {
+      renderRows();
     });
 
     allowOnceBtn.addEventListener('click', function() {
@@ -783,6 +942,10 @@ const riskControlPageHTML = `<!DOCTYPE html>
 
     observeTabBtn.addEventListener('click', function() {
       if (activeView !== 'observe') switchView('observe');
+    });
+
+    logsTabBtn.addEventListener('click', function() {
+      if (activeView !== 'logs') switchView('logs');
     });
 
     window.addEventListener('load', function() {

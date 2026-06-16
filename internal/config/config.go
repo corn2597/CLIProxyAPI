@@ -295,7 +295,7 @@ type RiskControlConfig struct {
 	BlockedSessionTTL string `yaml:"blocked-session-ttl" json:"blocked-session-ttl"`
 	// AllowSessionTTL controls how long a manual session allow override remains active. Default: 1h.
 	AllowSessionTTL string `yaml:"allow-session-ttl" json:"allow-session-ttl"`
-	// BlockThreshold is the minimum structured confidence required to enforce a block. Values below 0.99 are raised to 0.99.
+	// BlockThreshold is the minimum structured confidence required to enforce a block. Values below 0.97 are raised to 0.97.
 	BlockThreshold float64 `yaml:"block-threshold" json:"block-threshold"`
 	// MaxInputRunes is deprecated and ignored by risk control v2. Full user input is forwarded to audit.
 	MaxInputRunes int `yaml:"max-input-runes" json:"max-input-runes"`

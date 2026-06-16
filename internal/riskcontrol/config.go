@@ -25,7 +25,7 @@ const (
 	defaultSessionAuditInterval = 5 * time.Minute
 	defaultSessionTTL           = 24 * time.Hour
 	defaultBlockedSessionTTL    = 7 * 24 * time.Hour
-	defaultBlockThreshold       = 0.99
+	defaultBlockThreshold       = 0.97
 	defaultMaxInputRunes        = 0
 	defaultMaxInputImages       = 0
 	defaultBlockStatus          = http.StatusForbidden

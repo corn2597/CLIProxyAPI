@@ -80,7 +80,10 @@ func EnsureCodexAllowed(ctx context.Context, cfg *config.Config, req executor.Re
 		log.WithError(err).WithField("session_id", sessionID).Warn("risk control: failed to load manual override")
 	}
 	decision, decisionSource := defaultTracker.evaluate(sessionID, now, settings.sessionAuditInterval, settings.sessionTTL, settings.blockedSessionTTL, func() Decision {
-		return performAudit(ctx, cfg, settings, sessionID, req.Model, input)
+		auditStartedAt := time.Now()
+		auditDecision := performAudit(ctx, cfg, settings, sessionID, req.Model, input)
+		recordCodexAuditLog(auditStartedAt, time.Since(auditStartedAt), settings, sessionID, req, opts, input, auditDecision)
+		return auditDecision
 	})
 	if decisionSource == DecisionSourceFreshAudit {
 		log.WithFields(log.Fields{
@@ -123,6 +126,72 @@ func recordCodexObserveEvent(now time.Time, settings settings, sessionID string,
 	event.DecisionSource = DecisionSourceObserveOnly
 	event.BlockMessage = ""
 	DefaultObserveEventStore().RecordBlockedEvent(event)
+}
+
+func recordCodexAuditLog(auditedAt time.Time, duration time.Duration, settings settings, sessionID string, req executor.Request, opts executor.Options, input AuditInput, decision Decision) {
+	entry := codexAuditLogEntry(auditedAt, duration, settings, sessionID, req, opts, input, decision)
+	DefaultAuditLogStore().RecordAuditLog(entry)
+}
+
+func codexAuditLogEntry(auditedAt time.Time, duration time.Duration, settings settings, sessionID string, req executor.Request, opts executor.Options, input AuditInput, decision Decision) AuditLogEntry {
+	requestedModel := metadataString(opts.Metadata, executor.RequestedModelMetadataKey)
+	if requestedModel == "" {
+		requestedModel = metadataString(req.Metadata, executor.RequestedModelMetadataKey)
+	}
+	if requestedModel == "" {
+		requestedModel = req.Model
+	}
+
+	requestPath := metadataString(opts.Metadata, executor.RequestPathMetadataKey)
+	if requestPath == "" {
+		requestPath = metadataString(req.Metadata, executor.RequestPathMetadataKey)
+	}
+
+	return AuditLogEntry{
+		AuditedAt:         auditedAt,
+		DurationMS:        duration.Milliseconds(),
+		Provider:          "codex",
+		SessionID:         sessionID,
+		RequestedModel:    requestedModel,
+		UpstreamModel:     strings.TrimSpace(req.Model),
+		AuditModel:        settings.model,
+		AuditEndpoint:     settings.endpoint,
+		Mode:              settings.mode,
+		Threshold:         settings.blockThreshold,
+		SourceFormat:      strings.TrimSpace(opts.SourceFormat.String()),
+		RequestPath:       requestPath,
+		MessageCount:      input.MessageCount,
+		InputHash:         input.Hash,
+		UserTextPreview:   input.Text,
+		ImageReferences:   input.Images,
+		Decision:          auditLogDecision(decision),
+		Enforced:          settings.mode == ModePreBlock && decision.Blocked,
+		Blocked:           decision.Blocked,
+		ObserveOnly:       decision.ObserveOnly,
+		PolicyCode:        decision.PolicyCode,
+		SubcategoryCode:   decision.SubcategoryCode,
+		Confidence:        decision.Confidence,
+		AuthorizedContext: decision.AuthorizedContext,
+		MaliciousIntent:   decision.MaliciousIntent,
+		Evidence:          cloneStrings(decision.Evidence),
+		Reason:            decision.Reason,
+		AuditError:        decision.Error,
+		FailureClass:      decision.FailureClass,
+		RawAuditResponse:  decision.RawResponse,
+	}
+}
+
+func auditLogDecision(decision Decision) string {
+	if decision.Error != "" || decision.FailureClass != "" {
+		return "error"
+	}
+	if decision.Blocked {
+		return "block"
+	}
+	if decision.ObserveOnly {
+		return "observe"
+	}
+	return "allow"
 }
 
 func codexRiskControlEvent(now time.Time, settings settings, sessionID string, req executor.Request, opts executor.Options, input AuditInput, decision Decision, decisionSource string) BlockEvent {

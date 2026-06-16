@@ -760,6 +760,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/risk-control/observations", s.mgmt.GetRiskControlObservations)
 		mgmt.POST("/risk-control/observations/:id/allow", s.mgmt.PostRiskControlObservationAllow)
 		mgmt.POST("/risk-control/observations/:id/block", s.mgmt.PostRiskControlObservationBlock)
+		mgmt.GET("/risk-control/logs", s.mgmt.GetRiskControlLogs)
 		mgmt.GET("/risk-control/page", s.mgmt.GetRiskControlPage)
 	}
 }
@@ -922,6 +923,10 @@ func (s *Server) configureRiskControlBlockedEventStore(logDir string) {
 	observeFilePath := filepath.Join(logDir, "risk-control-observe.jsonl")
 	if err := riskcontrol.ConfigureDefaultObserveEventStore(observeFilePath); err != nil {
 		log.WithError(err).Warn("risk control: observe-event store persistence configuration failed")
+	}
+	auditLogFilePath := filepath.Join(logDir, "risk-control-audit-logs.jsonl")
+	if err := riskcontrol.ConfigureDefaultAuditLogStore(auditLogFilePath); err != nil {
+		log.WithError(err).Warn("risk control: audit-log store persistence configuration failed")
 	}
 	banFilePath := filepath.Join(logDir, "risk-control-session-bans.json")
 	if err := riskcontrol.ConfigureDefaultSessionBanStore(banFilePath); err != nil {

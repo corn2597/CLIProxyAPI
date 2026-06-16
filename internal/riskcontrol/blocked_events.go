@@ -55,6 +55,13 @@ type BlockEvent struct {
 	MaliciousIntent   bool      `json:"malicious_intent,omitempty"`
 	Evidence          []string  `json:"evidence,omitempty"`
 	RawAuditResponse  string    `json:"raw_audit_response,omitempty"`
+	LabelStatus       string    `json:"label_status,omitempty"`
+	SampleID          uint64    `json:"sample_id,omitempty"`
+	SampleKey         string    `json:"sample_key,omitempty"`
+	SampleLabel       string    `json:"sample_label,omitempty"`
+	SampleAction      string    `json:"sample_action,omitempty"`
+	SampleLabeledAt   time.Time `json:"sample_labeled_at,omitempty"`
+	SampleConflict    bool      `json:"sample_conflict,omitempty"`
 }
 
 // BlockEventListOptions controls blocked-event listing.
@@ -411,9 +418,16 @@ func sanitizeBlockedEvent(event BlockEvent) BlockEvent {
 	event.SubcategoryCode = normalizeSubcategoryCode(event.SubcategoryCode)
 	event.AuthorizedContext = normalizeAuthorizedContext(event.AuthorizedContext)
 	event.RawAuditResponse = strings.TrimSpace(event.RawAuditResponse)
+	event.LabelStatus = strings.TrimSpace(event.LabelStatus)
+	event.SampleKey = strings.TrimSpace(event.SampleKey)
+	event.SampleLabel = strings.TrimSpace(event.SampleLabel)
+	event.SampleAction = strings.TrimSpace(event.SampleAction)
 	event.UserTextPreview = strings.TrimSpace(event.UserTextPreview)
 	event.ImageReferences = cloneStrings(event.ImageReferences)
 	event.Evidence = cloneStrings(event.Evidence)
+	if !event.SampleLabeledAt.IsZero() {
+		event.SampleLabeledAt = event.SampleLabeledAt.UTC()
+	}
 	if event.BlockedAt.IsZero() {
 		event.BlockedAt = time.Now().UTC()
 	} else {
