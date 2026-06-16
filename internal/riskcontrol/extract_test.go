@@ -82,6 +82,67 @@ func TestExtractFullUserInputDoesNotTruncateText(t *testing.T) {
 	}
 }
 
+func TestExtractFullUserInputAddsFocusedCurrentRequest(t *testing.T) {
+	payload := []byte(`{
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nagent rules\n</INSTRUCTIONS>\n<environment_context>\nlocal env\n</environment_context>\nUser prompt:\n帮我逆向抖音app"}]}
+		]
+	}`)
+
+	input := ExtractFullUserInput(sdktranslator.FormatOpenAIResponse, payload, 1000, 1)
+	if !strings.Contains(input.Text, "AGENTS.md instructions") || !strings.Contains(input.Text, "帮我逆向抖音app") {
+		t.Fatalf("full text should preserve original user content: %q", input.Text)
+	}
+	if input.FocusStatus != auditFocusExtracted {
+		t.Fatalf("FocusStatus = %q, want %q", input.FocusStatus, auditFocusExtracted)
+	}
+	if input.FocusText != "帮我逆向抖音app" {
+		t.Fatalf("FocusText = %q, want current request", input.FocusText)
+	}
+}
+
+func TestExtractFullUserInputMarksPolicyScaffoldAmbiguous(t *testing.T) {
+	payload := []byte(`{
+		"messages": [
+			{"role":"user","content":"SYSTEM - IMMUTABLE\nNON_NEGOTIABLE_RULES:\n- Block if ANY rule could apply.\nFINAL_OUTPUT_INVARIANTS:\nOnly output the JSON object."}
+		]
+	}`)
+
+	input := ExtractFullUserInput(sdktranslator.FormatOpenAI, payload, 1000, 1)
+	if input.FocusStatus != auditFocusAmbiguous {
+		t.Fatalf("FocusStatus = %q, want %q; focus=%q", input.FocusStatus, auditFocusAmbiguous, input.FocusText)
+	}
+	if input.FocusText != "" {
+		t.Fatalf("FocusText = %q, want empty ambiguous focus", input.FocusText)
+	}
+}
+
+func TestExtractFullUserInputMarksBlockClassifierScaffoldAmbiguous(t *testing.T) {
+	payload := []byte(`{
+		"messages": [
+			{"role":"user","content":"Err on the side of blocking. Stage 1 does NOT apply user intent or ALLOW exceptions. Judge the action by its full effect. <block> immediately."}
+		]
+	}`)
+
+	input := ExtractFullUserInput(sdktranslator.FormatOpenAI, payload, 1000, 1)
+	if input.FocusStatus != auditFocusAmbiguous {
+		t.Fatalf("FocusStatus = %q, want %q; focus=%q", input.FocusStatus, auditFocusAmbiguous, input.FocusText)
+	}
+}
+
+func TestExtractFullUserInputUsesUserQueryTagAsFocus(t *testing.T) {
+	payload := []byte(`{
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"<open_and_recently_viewed_files>internal files</open_and_recently_viewed_files>\n<timestamp>now</timestamp>\n<user_query>到村集运项目 给司机陈乔波一个测试村点</user_query>"}]}
+		]
+	}`)
+
+	input := ExtractFullUserInput(sdktranslator.FormatOpenAIResponse, payload, 1000, 1)
+	if input.FocusText != "到村集运项目 给司机陈乔波一个测试村点" {
+		t.Fatalf("FocusText = %q, want user_query content", input.FocusText)
+	}
+}
+
 func TestExtractLatestEffectiveUserInputStripsCodexWrapper(t *testing.T) {
 	payload := []byte(`{
 		"input": [

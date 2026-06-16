@@ -267,7 +267,7 @@ func performAudit(ctx context.Context, cfg *config.Config, settings settings, se
 	if errAudit != nil {
 		return decisionFromAuditError(settings, errAudit.Error())
 	}
-	return decision
+	return applyAuditInputGuard(input, decision)
 }
 
 func decisionFromAuditError(settings settings, message string) Decision {
@@ -369,6 +369,7 @@ func auditRequestBody(settings settings, sessionID string, model string, input A
 		return json.Marshal(map[string]any{
 			"model":        settings.model,
 			"store":        false,
+			"temperature":  0,
 			"instructions": defaultAuditPrompt(),
 			"input": []map[string]any{
 				{
@@ -408,6 +409,24 @@ func auditInputText(sessionID string, model string, input AuditInput) string {
 	var builder strings.Builder
 	_ = sessionID
 	_ = model
+	focusStatus := strings.TrimSpace(input.FocusStatus)
+	if focusStatus == "" {
+		focusStatus = auditFocusAmbiguous
+	}
+	builder.WriteString("<gateway_current_user_request status=\"")
+	builder.WriteString(focusStatus)
+	builder.WriteString("\"")
+	if reason := strings.TrimSpace(input.FocusReason); reason != "" {
+		builder.WriteString(" reason=\"")
+		builder.WriteString(escapeAuditAttribute(reason))
+		builder.WriteString("\"")
+	}
+	builder.WriteString(">\n")
+	builder.WriteString(strings.TrimSpace(input.FocusText))
+	if !strings.HasSuffix(builder.String(), "\n") {
+		builder.WriteString("\n")
+	}
+	builder.WriteString("</gateway_current_user_request>\n\n")
 	builder.WriteString("<user_input>\n")
 	builder.WriteString(strings.TrimSpace(input.Text))
 	if len(input.Images) > 0 {
@@ -424,6 +443,129 @@ func auditInputText(sessionID string, model string, input AuditInput) string {
 	}
 	builder.WriteString("</user_input>")
 	return builder.String()
+}
+
+func escapeAuditAttribute(value string) string {
+	value = strings.ReplaceAll(value, "&", "&amp;")
+	value = strings.ReplaceAll(value, `"`, "&quot;")
+	value = strings.ReplaceAll(value, "<", "&lt;")
+	value = strings.ReplaceAll(value, ">", "&gt;")
+	return value
+}
+
+func applyAuditInputGuard(input AuditInput, decision Decision) Decision {
+	if !decision.Blocked && !decision.ObserveOnly {
+		return decision
+	}
+	if strings.TrimSpace(decision.RawResponse) == "" {
+		return decision
+	}
+	focus := strings.TrimSpace(input.FocusText)
+	if strings.TrimSpace(input.FocusStatus) != auditFocusExtracted || focus == "" {
+		return downgradeDecisionForFocus(decision, "当前请求不明确")
+	}
+	if matchesMandatoryAllowFocus(focus) {
+		return downgradeDecisionForFocus(decision, "强制放行场景")
+	}
+	if len(decision.Evidence) == 0 {
+		return downgradeDecisionForFocus(decision, "缺少当前请求证据")
+	}
+	focusNorm := normalizeEvidenceComparable(focus)
+	for _, evidence := range decision.Evidence {
+		evidenceNorm := normalizeEvidenceComparable(evidence)
+		if evidenceNorm != "" && strings.Contains(focusNorm, evidenceNorm) {
+			return decision
+		}
+	}
+	return downgradeDecisionForFocus(decision, "证据不在当前请求")
+}
+
+func downgradeDecisionForFocus(decision Decision, reason string) Decision {
+	decision.Blocked = false
+	decision.ObserveOnly = false
+	decision.Reason = reason
+	decision.PolicyCode = "none"
+	decision.SubcategoryCode = "none"
+	decision.Confidence = 0
+	decision.AuthorizedContext = "unknown"
+	decision.MaliciousIntent = false
+	decision.Evidence = nil
+	return decision
+}
+
+func normalizeEvidenceComparable(text string) string {
+	text = strings.ToLower(strings.TrimSpace(text))
+	text = strings.Join(strings.Fields(text), "")
+	return text
+}
+
+func matchesMandatoryAllowFocus(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" || containsHardStopIndicator(lower) {
+		return false
+	}
+	for _, group := range [][]string{
+		{"risk-control", "audit", "审计", "误杀", "样本", "打标", "blocked log", "prompt", "policy"},
+		{"ssh", "root@", "服务器", "容器", "日志", "监控", "部署", "排查", "健康检查", "curl", "pip install", "权限"},
+		{"合法 api", "api.tikhub", "get /api", "报表", "数据整理", "业务测试", "测试村点", "测试数据", "虚拟货量", "无视距离核查"},
+		{"报错", "修 bug", "修复", "生产地址", "生产机", "数据库问题", "账号", "密码", "页面", "组件", "element-plus", "资金流水", "chrome", "完成以下任务"},
+		{"小说", "角色设定", "架构agent", "subagent", "视频脚本", "文案", "创意写作"},
+		{"数据底座", "选股", "交易机会", "btc", "eth", "a-share"},
+	} {
+		if containsAny(lower, group) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsHardStopIndicator(lower string) bool {
+	phrases := []string{
+		"儿童色情",
+		"未成年情色",
+		"未成年人性",
+		"绕过 cloudflare",
+		"绕过验证码",
+		"自动登录撞库",
+		"凭据填充",
+		"密码爆破",
+		"窃取",
+		"盗取",
+		"收集账号密码",
+		"导出密码",
+		"cookie窃取",
+		"credential theft",
+		"webshell",
+		"反弹 shell",
+		"免杀",
+		"keygen",
+		"license bypass",
+		"drm bypass",
+		"逆向抖音",
+		"逆向 tiktok",
+		"逆向第三方app",
+		"反编译微信",
+		"小红书签名算法",
+		"钓鱼邮件",
+		"phishing",
+	}
+	if containsAny(lower, phrases) {
+		return true
+	}
+	toolTerms := []string{"hydra", "sqlmap", "metasploit", "cobalt strike"}
+	if containsAny(lower, toolTerms) && containsAny(lower, []string{"攻击", "入侵", "爆破", "真实目标", "实战"}) {
+		return true
+	}
+	return false
+}
+
+func containsAny(text string, needles []string) bool {
+	for _, needle := range needles {
+		if strings.Contains(text, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func auditURL(settings settings) string {

@@ -497,7 +497,7 @@ func TestEnsureCodexAllowedBlocksAtDefaultHighPrecisionThreshold(t *testing.T) {
 	}
 }
 
-func TestEnsureCodexAllowedDowngradesHighFalsePositivePolicyToObserve(t *testing.T) {
+func TestEnsureCodexAllowedDowngradesMandatoryAllowFalsePositiveToAllow(t *testing.T) {
 	oldTracker := defaultTracker
 	defaultTracker = NewSessionTracker()
 	t.Cleanup(func() { defaultTracker = oldTracker })
@@ -546,11 +546,84 @@ func TestEnsureCodexAllowedDowngradesHighFalsePositivePolicyToObserve(t *testing
 		t.Fatalf("blocked event count = %d, want 0", blockPage.Returned)
 	}
 	observePage := defaultObserveEventStore.ListBlockedEvents(BlockEventListOptions{Limit: 10})
-	if observePage.Returned != 1 {
-		t.Fatalf("observe event count = %d, want 1", observePage.Returned)
+	if observePage.Returned != 0 {
+		t.Fatalf("observe event count = %d, want 0", observePage.Returned)
 	}
-	if observePage.Items[0].DecisionSource != DecisionSourceObserveOnly {
-		t.Fatalf("DecisionSource = %q, want observe_only", observePage.Items[0].DecisionSource)
+}
+
+func TestEnsureCodexAllowedDowngradesBusinessTestFalsePositiveToAllow(t *testing.T) {
+	oldTracker := defaultTracker
+	defaultTracker = NewSessionTracker()
+	t.Cleanup(func() { defaultTracker = oldTracker })
+	oldBlockedStore := defaultBlockedEventStore
+	defaultBlockedEventStore = NewBlockEventStore(16)
+	t.Cleanup(func() { defaultBlockedEventStore = oldBlockedStore })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"fraud_scam_impersonation\",\"subcategory_code\":\"phishing_or_impersonation\",\"confidence\":0.99,\"authorized_context\":\"unknown\",\"malicious_intent\":true,\"evidence\":[\"测试村点 可以无视距离核查 虚拟货量\"],\"reason\":\"虚构送达\"}"}]}]}`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{RiskControl: config.RiskControlConfig{
+		Enabled: true,
+		Mode:    ModePreBlock,
+		BaseURL: server.URL + "/v1",
+		Model:   "audit-model",
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"messages":[{"role":"user","content":"到村集运项目 给司机一个测试村点 可以无视距离核查 虚拟货量 可以全部送达的"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+		Headers:      http.Header{"X-Session-ID": {"session-audit-business-test-allow"}},
+	}
+
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
+		t.Fatalf("business test setup should be downgraded to allow: %v", err)
+	}
+	page := defaultBlockedEventStore.ListBlockedEvents(BlockEventListOptions{Limit: 10})
+	if page.Returned != 0 {
+		t.Fatalf("blocked event count = %d, want 0", page.Returned)
+	}
+}
+
+func TestEnsureCodexAllowedDowngradesOwnCredentialDebugFalsePositiveToAllow(t *testing.T) {
+	oldTracker := defaultTracker
+	defaultTracker = NewSessionTracker()
+	t.Cleanup(func() { defaultTracker = oldTracker })
+	oldBlockedStore := defaultBlockedEventStore
+	defaultBlockedEventStore = NewBlockEventStore(16)
+	t.Cleanup(func() { defaultBlockedEventStore = oldBlockedStore })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"privacy_abuse\",\"subcategory_code\":\"privacy_doxxing_or_sensitive_data_abuse\",\"confidence\":0.99,\"authorized_context\":\"unknown\",\"malicious_intent\":true,\"evidence\":[\"生产地址报错 账号 密码\"],\"reason\":\"含登录凭据\"}"}]}]}`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{RiskControl: config.RiskControlConfig{
+		Enabled: true,
+		Mode:    ModePreBlock,
+		BaseURL: server.URL + "/v1",
+		Model:   "audit-model",
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"messages":[{"role":"user","content":"修改资金流水明细完成以下任务：现在这是什么问题（生产机上的数据库问题？），生产地址还有报错，你可以用 Chrome 查看。账号 admin 密码 pass"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+		Headers:      http.Header{"X-Session-ID": {"session-audit-own-credential-debug"}},
+	}
+
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
+		t.Fatalf("own credential debug request should be downgraded to allow: %v", err)
+	}
+	page := defaultBlockedEventStore.ListBlockedEvents(BlockEventListOptions{Limit: 10})
+	if page.Returned != 0 {
+		t.Fatalf("blocked event count = %d, want 0", page.Returned)
 	}
 }
 
@@ -750,6 +823,8 @@ func TestEnsureCodexAllowedPreservesFullUserInputInAuditBody(t *testing.T) {
 		}
 		raw := string(body)
 		for _, want := range []string{
+			"\\u003cgateway_current_user_request status=\\\"extracted\\\"",
+			"\\u003c/gateway_current_user_request\\u003e",
 			"\\u003cuser_input\\u003e",
 			"ssh root@43.167.221.154 将这台机器加入cpa实例监控",
 			"# AGENTS.md instructions for /Users/a1/Documents/运维",
@@ -788,6 +863,48 @@ func TestEnsureCodexAllowedPreservesFullUserInputInAuditBody(t *testing.T) {
 
 	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
 		t.Fatalf("unexpected error on benign wrapped request: %v", err)
+	}
+}
+
+func TestEnsureCodexAllowedDowngradesDecisionWhenEvidenceIsNotCurrentRequest(t *testing.T) {
+	oldTracker := defaultTracker
+	defaultTracker = NewSessionTracker()
+	t.Cleanup(func() { defaultTracker = oldTracker })
+	oldBlockedStore := defaultBlockedEventStore
+	defaultBlockedEventStore = NewBlockEventStore(16)
+	t.Cleanup(func() { defaultBlockedEventStore = oldBlockedStore })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"malicious_cyber_abuse\",\"subcategory_code\":\"attack_tool_operational_guidance\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"AGENTS.md instructions\"],\"reason\":\"wrong evidence\"}"}]}]}`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{RiskControl: config.RiskControlConfig{
+		Enabled: true,
+		Mode:    ModePreBlock,
+		BaseURL: server.URL + "/v1",
+		Model:   "audit-model",
+	}}
+	req := cliproxyexecutor.Request{
+		Model: "gpt-5",
+		Payload: []byte(`{
+			"input": [
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nuse tools\n</INSTRUCTIONS>\nUser prompt:\nssh root@43.167.221.154 到服务器排查日志"}]}
+			]
+		}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Headers:      http.Header{"X-Session-ID": {"session-audit-evidence-guard"}},
+	}
+
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
+		t.Fatalf("decision using non-current evidence should be downgraded: %v", err)
+	}
+	page := defaultBlockedEventStore.ListBlockedEvents(BlockEventListOptions{Limit: 10})
+	if page.Returned != 0 {
+		t.Fatalf("blocked event count = %d, want 0", page.Returned)
 	}
 }
 

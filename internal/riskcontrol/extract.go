@@ -16,6 +16,9 @@ type AuditInput struct {
 	Images       []string
 	MessageCount int
 	Hash         string
+	FocusText    string
+	FocusStatus  string
+	FocusReason  string
 }
 
 type auditTurn struct {
@@ -24,6 +27,11 @@ type auditTurn struct {
 }
 
 const defaultAuditContextBackfillTurns = 2
+
+const (
+	auditFocusExtracted = "extracted"
+	auditFocusAmbiguous = "ambiguous"
+)
 
 func (i AuditInput) Empty() bool {
 	return strings.TrimSpace(i.Text) == "" && len(i.Images) == 0
@@ -58,11 +66,15 @@ func ExtractLatestEffectiveUserInput(format sdktranslator.Format, payload []byte
 	}
 	text := truncateRunes(normalizeAuditText(strings.Join(parts, "\n\n")), maxRunes)
 	hash := sha256.Sum256([]byte(text + "\n" + strings.Join(images, "\n")))
+	focusText, focusStatus, focusReason := deriveAuditFocusFromText(text)
 	return AuditInput{
 		Text:         text,
 		Images:       images,
 		MessageCount: messages,
 		Hash:         hex.EncodeToString(hash[:]),
+		FocusText:    focusText,
+		FocusStatus:  focusStatus,
+		FocusReason:  focusReason,
 	}
 }
 
@@ -71,30 +83,32 @@ func ExtractFullUserInput(format sdktranslator.Format, payload []byte, maxRunes 
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return AuditInput{}
 	}
+	turns := collectUserTurns(format, payload)
 	var parts []string
 	var images []string
-	var messages int
-	switch strings.ToLower(strings.TrimSpace(format.String())) {
-	case sdktranslator.FormatOpenAI.String():
-		messages = collectOpenAIChatUsers(gjson.GetBytes(payload, "messages"), &parts, &images, maxImages)
-	case sdktranslator.FormatOpenAIResponse.String(), "responses", "openai-responses":
-		messages = collectResponsesUsers(gjson.GetBytes(payload, "input"), &parts, &images, maxImages)
-	case sdktranslator.FormatClaude.String():
-		messages = collectRoleMessages(gjson.GetBytes(payload, "messages"), "user", &parts, &images, maxImages)
-	case sdktranslator.FormatGemini.String(), sdktranslator.FormatGeminiCLI.String():
-		messages = collectGeminiUsers(gjson.GetBytes(payload, "contents"), &parts, &images, maxImages)
-	default:
-		messages += collectOpenAIChatUsers(gjson.GetBytes(payload, "messages"), &parts, &images, maxImages)
-		messages += collectResponsesUsers(gjson.GetBytes(payload, "input"), &parts, &images, maxImages)
-		messages += collectGeminiUsers(gjson.GetBytes(payload, "contents"), &parts, &images, maxImages)
+	messages := 0
+	for _, turn := range turns {
+		beforeParts := len(parts)
+		beforeImages := len(images)
+		addAuditText(&parts, turn.Text)
+		for _, image := range turn.Images {
+			addImageURL(&images, image, maxImages)
+		}
+		if len(parts) > beforeParts || len(images) > beforeImages {
+			messages++
+		}
 	}
 	text := normalizeAuditText(strings.Join(parts, "\n\n"))
 	hash := sha256.Sum256([]byte(text + "\n" + strings.Join(images, "\n")))
+	focusText, focusStatus, focusReason := deriveAuditFocusFromTurns(turns)
 	return AuditInput{
 		Text:         text,
 		Images:       images,
 		MessageCount: messages,
 		Hash:         hex.EncodeToString(hash[:]),
+		FocusText:    focusText,
+		FocusStatus:  focusStatus,
+		FocusReason:  focusReason,
 	}
 }
 
@@ -478,10 +492,16 @@ func stripHostScaffolding(text string) string {
 		return ""
 	}
 
+	if extracted := extractLastTaggedContent(text, "user_query"); extracted != "" {
+		return normalizeAuditText(extracted)
+	}
+
 	if extracted := extractAfterLastMarker(text, []string{
 		"User prompt:\n",
+		"User prompt:",
 		"## My request for Codex:\n",
 		"My request for Codex:\n",
+		"[新消息]\n",
 	}); extracted != "" && extracted != text {
 		text = extracted
 	}
@@ -494,6 +514,12 @@ func stripHostScaffolding(text string) string {
 		{"<collaboration_mode>", "</collaboration_mode>"},
 		{"<skills_instructions>", "</skills_instructions>"},
 		{"<plugins_instructions>", "</plugins_instructions>"},
+		{"<system-reminder>", "</system-reminder>"},
+		{"<transcript>", "</transcript>"},
+		{"<codex_internal_context>", "</codex_internal_context>"},
+		{"<open_and_recently_viewed_files>", "</open_and_recently_viewed_files>"},
+		{"<timestamp>", "</timestamp>"},
+		{"<skill>", "</skill>"},
 	} {
 		text = removeTaggedBlock(text, tag[0], tag[1])
 	}
@@ -507,6 +533,181 @@ func stripHostScaffolding(text string) string {
 		filtered = append(filtered, line)
 	}
 	return strings.TrimSpace(strings.Join(filtered, "\n"))
+}
+
+func deriveAuditFocusFromTurns(turns []auditTurn) (string, string, string) {
+	if len(turns) == 0 {
+		return "", auditFocusAmbiguous, "no_user_turn"
+	}
+	sanitized := sanitizeAuditTurns(turns)
+	selected := selectEffectiveAuditTurns(sanitized, defaultAuditContextBackfillTurns)
+	if len(selected) == 0 {
+		return "", auditFocusAmbiguous, "no_effective_turn"
+	}
+	parts := make([]string, 0, len(selected))
+	for _, turn := range selected {
+		addAuditText(&parts, turn.Text)
+	}
+	return deriveAuditFocusFromText(strings.Join(parts, "\n\n"))
+}
+
+func deriveAuditFocusFromText(text string) (string, string, string) {
+	text = normalizeAuditText(strings.TrimSpace(text))
+	if text == "" {
+		return "", auditFocusAmbiguous, "empty"
+	}
+	candidate := normalizeAuditText(stripHostScaffolding(text))
+	if candidate == "" {
+		return "", auditFocusAmbiguous, "empty_after_scaffold"
+	}
+	if looksLikePolicyOrAgentScaffold(candidate) {
+		return "", auditFocusAmbiguous, "policy_or_agent_scaffold"
+	}
+	if len([]rune(candidate)) > 6000 {
+		if startsLikeContinuationTask(candidate) {
+			head := leadingAuditWindow(candidate, 1400)
+			if head != "" && !looksLikePolicyOrAgentScaffold(head) {
+				return head, auditFocusExtracted, "long_context_head"
+			}
+		}
+		tail := trailingAuditWindow(candidate, 1400)
+		if tail == "" || looksLikePolicyOrAgentScaffold(tail) || looksLikeHandoffSummary(tail) {
+			return "", auditFocusAmbiguous, "long_context_scaffold"
+		}
+		return tail, auditFocusExtracted, "long_context_tail"
+	}
+	return candidate, auditFocusExtracted, "current_turn"
+}
+
+func leadingAuditWindow(text string, maxRunes int) string {
+	text = normalizeAuditText(text)
+	if maxRunes <= 0 {
+		return text
+	}
+	runes := []rune(text)
+	if len(runes) <= maxRunes {
+		return text
+	}
+	head := string(runes[:maxRunes])
+	if idx := strings.LastIndex(head, "\n\n"); idx > 0 {
+		head = head[:idx]
+	}
+	return normalizeAuditText(head)
+}
+
+func trailingAuditWindow(text string, maxRunes int) string {
+	text = normalizeAuditText(text)
+	if maxRunes <= 0 {
+		return text
+	}
+	runes := []rune(text)
+	if len(runes) <= maxRunes {
+		return text
+	}
+	tail := string(runes[len(runes)-maxRunes:])
+	for _, sep := range []string{"\n\n", "\n", "。", "！", "？"} {
+		if idx := strings.Index(tail, sep); idx >= 0 && idx+len(sep) < len(tail) {
+			return normalizeAuditText(tail[idx+len(sep):])
+		}
+	}
+	return normalizeAuditText(tail)
+}
+
+func looksLikePolicyOrAgentScaffold(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	markers := []string{
+		"system - immutable",
+		"system — immutable",
+		"non_negotiable_rules",
+		"decision_algorithm",
+		"final_output_invariants",
+		"output_schema",
+		"block if any rule could apply",
+		"err on the side of blocking",
+		"<block> immediately",
+		"stage 1 does not apply user intent",
+		"allow exceptions",
+		"judge the action by its full effect",
+		"must not output any other text",
+		"only output the json object",
+		"execution-mode hard rule",
+		"tool calls",
+		"you are an ai gateway",
+		"你是 ai 网关",
+		"只输出 json",
+		"违规类型",
+		"判定原则",
+	}
+	hits := 0
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
+			hits++
+		}
+	}
+	if hits >= 2 {
+		return true
+	}
+	if len([]rune(lower)) > 3000 && hits >= 1 {
+		return true
+	}
+	return false
+}
+
+func startsLikeContinuationTask(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	if strings.HasPrefix(lower, "请继续 ") || strings.HasPrefix(lower, "继续 ") || strings.HasPrefix(lower, "continue from where you left off") {
+		return true
+	}
+	head := leadingAuditWindow(lower, 1200)
+	return strings.Contains(head, "当前任务") || strings.Contains(head, "current task") || strings.Contains(head, "任务性质")
+}
+
+func looksLikeHandoffSummary(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	markers := []string{
+		"another language model started",
+		"handoff",
+		"交接摘要",
+		"earlier also passed",
+		"important caveats",
+		"pending tasks",
+		"optional next step",
+		"most recent user message",
+		"pytest",
+		"tests/",
+		"当前任务",
+	}
+	hits := 0
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
+			hits++
+		}
+	}
+	return hits >= 2
+}
+
+func extractLastTaggedContent(text string, tagName string) string {
+	openTag := "<" + tagName + ">"
+	closeTag := "</" + tagName + ">"
+	start := strings.LastIndex(text, openTag)
+	if start < 0 {
+		return ""
+	}
+	start += len(openTag)
+	endRel := strings.Index(text[start:], closeTag)
+	if endRel < 0 {
+		return ""
+	}
+	return strings.TrimSpace(text[start : start+endRel])
 }
 
 func extractAfterLastMarker(text string, markers []string) string {
