@@ -11,6 +11,7 @@ import (
 const (
 	ModeOff      = "off"
 	ModeObserve  = "observe"
+	ModeDebug    = "debug"
 	ModePreBlock = "pre_block"
 
 	FailOpen   = "open"
@@ -60,6 +61,8 @@ func normalizeSettings(cfg *config.Config) settings {
 	switch mode {
 	case "", ModeObserve:
 		mode = ModeObserve
+	case "dry-run", "dry_run", ModeDebug:
+		mode = ModeDebug
 	case "pre-block", "preblock", ModePreBlock:
 		mode = ModePreBlock
 	case ModeOff:

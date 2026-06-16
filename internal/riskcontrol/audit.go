@@ -79,12 +79,19 @@ func EnsureCodexAllowed(ctx context.Context, cfg *config.Config, req executor.Re
 	} else if err != nil {
 		log.WithError(err).WithField("session_id", sessionID).Warn("risk control: failed to load manual override")
 	}
-	decision, decisionSource := defaultTracker.evaluate(sessionID, now, settings.sessionAuditInterval, settings.sessionTTL, settings.blockedSessionTTL, func() Decision {
+	audit := func() Decision {
 		auditStartedAt := time.Now()
 		auditDecision := performAudit(ctx, cfg, settings, sessionID, req.Model, input)
 		recordCodexAuditLog(auditStartedAt, time.Since(auditStartedAt), settings, sessionID, req, opts, input, auditDecision)
 		return auditDecision
-	})
+	}
+	var decision Decision
+	var decisionSource string
+	if settings.mode == ModeDebug {
+		decision, decisionSource = defaultTracker.evaluateWithoutBlockedBans(sessionID, now, settings.sessionAuditInterval, settings.sessionTTL, audit)
+	} else {
+		decision, decisionSource = defaultTracker.evaluate(sessionID, now, settings.sessionAuditInterval, settings.sessionTTL, settings.blockedSessionTTL, audit)
+	}
 	if decisionSource == DecisionSourceFreshAudit {
 		log.WithFields(log.Fields{
 			"provider":        "codex",
@@ -98,14 +105,11 @@ func EnsureCodexAllowed(ctx context.Context, cfg *config.Config, req executor.Re
 	if decisionSource == DecisionSourceFreshAudit && decision.ObserveOnly {
 		recordCodexObserveEvent(now, settings, sessionID, req, opts, input, decision, decisionSource)
 	}
+	if decisionSource == DecisionSourceFreshAudit && decision.Blocked && shouldRecordBlockedEvent(settings, decision) {
+		recordCodexBlockedEvent(now, settings, sessionID, req, opts, input, decision, decisionSource, riskControlBlockMessage(settings, decision))
+	}
 	if settings.mode == ModePreBlock && decision.Blocked {
-		message := settings.blockMessage
-		if decision.Reason != "" {
-			message = message + ": " + decision.Reason
-		}
-		if decisionSource == DecisionSourceFreshAudit {
-			recordCodexBlockedEvent(now, settings, sessionID, req, opts, input, decision, decisionSource, message)
-		}
+		message := riskControlBlockMessage(settings, decision)
 		status := settings.blockStatus
 		if status <= 0 {
 			status = defaultBlockStatus
@@ -113,6 +117,28 @@ func EnsureCodexAllowed(ctx context.Context, cfg *config.Config, req executor.Re
 		return RiskError{status: status, code: "risk_control_blocked", message: message}
 	}
 	return nil
+}
+
+func shouldRecordBlockedEvent(settings settings, decision Decision) bool {
+	if !decision.Blocked {
+		return false
+	}
+	switch settings.mode {
+	case ModePreBlock:
+		return true
+	case ModeDebug:
+		return decision.Error == ""
+	default:
+		return false
+	}
+}
+
+func riskControlBlockMessage(settings settings, decision Decision) string {
+	message := settings.blockMessage
+	if decision.Reason != "" {
+		message = message + ": " + decision.Reason
+	}
+	return message
 }
 
 func recordCodexBlockedEvent(now time.Time, settings settings, sessionID string, req executor.Request, opts executor.Options, input AuditInput, decision Decision, decisionSource string, blockMessage string) {

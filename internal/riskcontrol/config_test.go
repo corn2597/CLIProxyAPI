@@ -52,3 +52,18 @@ func TestNormalizeSettingsKeepsHigherBlockThreshold(t *testing.T) {
 		t.Fatalf("blockThreshold = %v, want 0.99", settings.blockThreshold)
 	}
 }
+
+func TestNormalizeSettingsAcceptsDebugMode(t *testing.T) {
+	t.Parallel()
+
+	settings := normalizeSettings(&config.Config{RiskControl: config.RiskControlConfig{
+		Enabled: true,
+		Mode:    "debug",
+		BaseURL: "http://audit.local/v1",
+		Model:   "audit-model",
+	}})
+
+	if settings.mode != ModeDebug {
+		t.Fatalf("mode = %q, want %q", settings.mode, ModeDebug)
+	}
+}

@@ -115,19 +115,31 @@ func (t *SessionTracker) state(sessionID string, now time.Time, ttl time.Duratio
 }
 
 func (t *SessionTracker) evaluate(sessionID string, now time.Time, interval time.Duration, ttl time.Duration, blockedTTL time.Duration, audit func() Decision) (Decision, string) {
+	return t.evaluateWithBlockedBans(sessionID, now, interval, ttl, blockedTTL, true, audit)
+}
+
+func (t *SessionTracker) evaluateWithoutBlockedBans(sessionID string, now time.Time, interval time.Duration, ttl time.Duration, audit func() Decision) (Decision, string) {
+	return t.evaluateWithBlockedBans(sessionID, now, interval, ttl, 0, false, audit)
+}
+
+func (t *SessionTracker) evaluateWithBlockedBans(sessionID string, now time.Time, interval time.Duration, ttl time.Duration, blockedTTL time.Duration, useBlockedBans bool, audit func() Decision) (Decision, string) {
 	state := t.state(sessionID, now, ttl)
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.lastSeenAt = now
 
-	if !state.blockedUntil.IsZero() {
+	if useBlockedBans && !state.blockedUntil.IsZero() {
 		if now.Before(state.blockedUntil) {
 			return state.lastDecision, DecisionSourceBlockedBan
 		}
 		state.blockedUntil = time.Time{}
 	}
-	if decision, ok := t.loadPersistedBlockedDecision(sessionID, now, state); ok {
-		return decision, DecisionSourceBlockedBan
+	if useBlockedBans {
+		if decision, ok := t.loadPersistedBlockedDecision(sessionID, now, state); ok {
+			return decision, DecisionSourceBlockedBan
+		}
+	} else {
+		state.blockedUntil = time.Time{}
 	}
 
 	due := state.lastAuditAt.IsZero() || now.Sub(state.lastAuditAt) >= interval
@@ -137,16 +149,18 @@ func (t *SessionTracker) evaluate(sessionID string, now time.Time, interval time
 	decision := audit()
 	decision.Audited = true
 	state.lastAuditAt = now
-	if decision.Blocked && blockedTTL > 0 && decision.Error == "" {
+	if useBlockedBans && decision.Blocked && blockedTTL > 0 && decision.Error == "" {
 		state.blockedUntil = now.Add(blockedTTL)
 		if err := t.upsertPersistedBan(sessionID, state.blockedUntil, decision.Reason, now); err != nil {
 			log.WithError(err).WithField("session_id", sessionID).Warn("risk control: failed to persist blocked session")
 		}
-	} else {
+	} else if useBlockedBans {
 		state.blockedUntil = time.Time{}
 		if err := t.deletePersistedBan(sessionID); err != nil {
 			log.WithError(err).WithField("session_id", sessionID).Warn("risk control: failed to clear blocked session persistence")
 		}
+	} else {
+		state.blockedUntil = time.Time{}
 	}
 	state.lastDecision = decision
 	return decision, DecisionSourceFreshAudit

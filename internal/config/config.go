@@ -271,7 +271,7 @@ type CodexConfig struct {
 type RiskControlConfig struct {
 	// Enabled toggles risk-control checks. When false, the feature is inert.
 	Enabled bool `yaml:"enabled" json:"enabled"`
-	// Mode controls enforcement: "off", "observe", or "pre_block".
+	// Mode controls enforcement: "off", "observe", "debug", or "pre_block".
 	Mode string `yaml:"mode" json:"mode"`
 	// BaseURL is an OpenAI-compatible API base URL, usually ending in /v1.
 	BaseURL string `yaml:"base-url" json:"base-url"`

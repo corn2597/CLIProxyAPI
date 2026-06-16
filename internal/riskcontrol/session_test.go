@@ -88,6 +88,31 @@ func TestSessionTrackerDoesNotBanAuditFailures(t *testing.T) {
 	}
 }
 
+func TestSessionTrackerDebugEvaluationIgnoresBlockedBans(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "risk-control-session-bans.json")
+	now := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
+	tracker := NewSessionTracker()
+	if err := tracker.ConfigurePersistence(filePath); err != nil {
+		t.Fatalf("ConfigurePersistence: %v", err)
+	}
+	if err := tracker.bans.Upsert("debug-session", now.Add(7*24*time.Hour), "previous block", now); err != nil {
+		t.Fatalf("Upsert persisted ban: %v", err)
+	}
+
+	calls := 0
+	decision, source := tracker.evaluateWithoutBlockedBans("debug-session", now.Add(time.Minute), 5*time.Minute, time.Hour, func() Decision {
+		calls++
+		return Decision{Reason: "debug audit"}
+	})
+
+	if source != DecisionSourceFreshAudit || calls != 1 {
+		t.Fatalf("debug evaluate source=%q calls=%d, want fresh audit", source, calls)
+	}
+	if decision.Blocked {
+		t.Fatalf("debug evaluate should use fresh non-block decision, got %+v", decision)
+	}
+}
+
 func TestSessionTrackerKeepsBlockedSessionUntilBanExpires(t *testing.T) {
 	tracker := NewSessionTracker()
 	now := time.Unix(3000, 0)
