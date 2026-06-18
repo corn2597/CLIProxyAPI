@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"net/http"
 	"net/url"
 
@@ -20,6 +21,9 @@ const DisallowFreeAuthMetadataKey = "disallow_free_auth"
 // ReasoningEffortMetadataKey stores the client-requested reasoning effort for usage logs.
 const ReasoningEffortMetadataKey = "reasoning_effort"
 
+// ServiceTierMetadataKey stores the client-requested service tier for usage logs.
+const ServiceTierMetadataKey = "service_tier"
+
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
@@ -29,6 +33,8 @@ const (
 	SelectedAuthCallbackMetadataKey = "selected_auth_callback"
 	// ExecutionSessionMetadataKey identifies a long-lived downstream execution session.
 	ExecutionSessionMetadataKey = "execution_session_id"
+	// RiskControlBypassMetadataKey marks internal audit requests that must not be audited again.
+	RiskControlBypassMetadataKey = "risk_control_bypass"
 )
 
 // Request encapsulates the translated payload that will be sent to a provider executor.
@@ -94,4 +100,21 @@ type StreamResult struct {
 type StatusError interface {
 	error
 	StatusCode() int
+}
+
+// RequestScopedError marks errors caused by the current request rather than by
+// the selected credential. Auth managers should return these without cooling
+// down or disabling the selected auth.
+type RequestScopedError interface {
+	error
+	RequestScoped() bool
+}
+
+// IsRequestScopedError reports whether err is request-scoped.
+func IsRequestScopedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var scoped RequestScopedError
+	return errors.As(err, &scoped) && scoped != nil && scoped.RequestScoped()
 }

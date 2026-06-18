@@ -43,6 +43,9 @@ type Config struct {
 	// RemoteManagement nests management-related options under 'remote-management'.
 	RemoteManagement RemoteManagement `yaml:"remote-management" json:"-"`
 
+	// Plugins configures dynamic plugin discovery and per-plugin settings.
+	Plugins PluginsConfig `yaml:"plugins" json:"plugins"`
+
 	// AuthDir is the directory where authentication token files are stored.
 	AuthDir string `yaml:"auth-dir" json:"-"`
 
@@ -52,7 +55,7 @@ type Config struct {
 	// Pprof config controls the optional pprof HTTP debug server.
 	Pprof PprofConfig `yaml:"pprof" json:"pprof"`
 
-	// CommercialMode disables high-overhead HTTP middleware features to minimize per-request memory usage.
+	// CommercialMode disables high-overhead request logging and HTTP middleware features to minimize per-request memory usage.
 	CommercialMode bool `yaml:"commercial-mode" json:"commercial-mode"`
 
 	// LoggingToFile controls whether application logs are written to rotating files or stdout.
@@ -111,6 +114,12 @@ type Config struct {
 	// Codex defines a list of Codex API key configurations as specified in the YAML configuration file.
 	CodexKey []CodexKey `yaml:"codex-api-key" json:"codex-api-key"`
 
+	// Codex configures provider-wide Codex request behavior.
+	Codex CodexConfig `yaml:"codex" json:"codex"`
+
+	// RiskControl configures pre-upstream LLM-based audit checks.
+	RiskControl RiskControlConfig `yaml:"risk-control" json:"risk-control"`
+
 	// CodexHeaderDefaults configures fallback headers for Codex OAuth model requests.
 	// These are used only when the client does not send its own headers.
 	CodexHeaderDefaults CodexHeaderDefaults `yaml:"codex-header-defaults" json:"codex-header-defaults"`
@@ -149,6 +158,87 @@ type Config struct {
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
 
+// PluginsConfig holds dynamic plugin system settings.
+type PluginsConfig struct {
+	// Enabled toggles dynamic plugin loading.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Dir is the plugin discovery directory.
+	Dir string `yaml:"dir" json:"dir"`
+	// Configs stores per-plugin instance configuration by plugin ID.
+	Configs map[string]PluginInstanceConfig `yaml:"configs" json:"configs"`
+}
+
+// PluginInstanceConfig stores host-owned plugin settings and the original plugin YAML subtree.
+type PluginInstanceConfig struct {
+	// Enabled toggles this plugin instance. Nil is normalized to true during YAML parsing.
+	Enabled *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// Priority controls plugin startup and routing order.
+	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
+	// Raw preserves the full original plugin configuration YAML subtree.
+	Raw yaml.Node `yaml:"-" json:"-"`
+}
+
+// UnmarshalYAML extracts host-owned fields while preserving the full original YAML node.
+func (c *PluginInstanceConfig) UnmarshalYAML(value *yaml.Node) error {
+	if c == nil {
+		return nil
+	}
+
+	c.Priority = 0
+	defaultEnabled := true
+	c.Enabled = &defaultEnabled
+
+	if value == nil || value.Kind == 0 {
+		c.Raw = *defaultPluginInstanceConfigNode()
+		return nil
+	}
+
+	c.Raw = *deepCopyNode(value)
+	if value.Kind != yaml.MappingNode {
+		return nil
+	}
+
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		key := value.Content[i]
+		node := value.Content[i+1]
+		if key == nil {
+			continue
+		}
+		switch key.Value {
+		case "enabled":
+			var enabled bool
+			if errDecodeEnabled := node.Decode(&enabled); errDecodeEnabled != nil {
+				return fmt.Errorf("parse plugin enabled: %w", errDecodeEnabled)
+			}
+			c.Enabled = &enabled
+		case "priority":
+			var priority int
+			if errDecodePriority := node.Decode(&priority); errDecodePriority != nil {
+				return fmt.Errorf("parse plugin priority: %w", errDecodePriority)
+			}
+			c.Priority = priority
+		}
+	}
+
+	return nil
+}
+
+// MarshalYAML returns the preserved raw plugin YAML subtree for lossless config output.
+func (c PluginInstanceConfig) MarshalYAML() (any, error) {
+	if c.Raw.Kind == 0 {
+		return defaultPluginInstanceConfigNode(), nil
+	}
+	return deepCopyNode(&c.Raw), nil
+}
+
+func defaultPluginInstanceConfigNode() *yaml.Node {
+	return &yaml.Node{
+		Kind:    yaml.MappingNode,
+		Tag:     "!!map",
+		Content: []*yaml.Node{},
+	}
+}
+
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.
 // In legacy mode, UserAgent/PackageVersion/RuntimeVersion/Timeout act as fallbacks when
 // the client omits them, while OS/Arch remain runtime-derived. When stabilized device
@@ -170,6 +260,61 @@ type ClaudeHeaderDefaults struct {
 type CodexHeaderDefaults struct {
 	UserAgent    string `yaml:"user-agent" json:"user-agent"`
 	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
+}
+
+// CodexConfig configures provider-wide Codex request behavior.
+type CodexConfig struct {
+	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+}
+
+// RiskControlConfig configures LLM-based request auditing before provider execution.
+type RiskControlConfig struct {
+	// Enabled toggles risk-control checks. When false, the feature is inert.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Mode controls enforcement: "off", "observe", "pre_block", or "async_block".
+	Mode string `yaml:"mode" json:"mode"`
+	// Debug enables shadow mode: audit/logging still runs, but no real ban is applied.
+	Debug bool `yaml:"debug" json:"debug"`
+	// BaseURL is an OpenAI-compatible API base URL, usually ending in /v1.
+	BaseURL string `yaml:"base-url" json:"base-url"`
+	// Endpoint selects the OpenAI-compatible endpoint. Default: "responses".
+	Endpoint string `yaml:"endpoint" json:"endpoint"`
+	// Model is the audit model sent to the configured API endpoint.
+	Model string `yaml:"model" json:"model"`
+	// APIKey is the single audit API key. Prefer APIKeys for rotation.
+	APIKey string `yaml:"api-key" json:"-"`
+	// APIKeys are audit API keys rotated independently from provider OAuth pools.
+	APIKeys []string `yaml:"api-keys" json:"-"`
+	// TimeoutMS bounds the synchronous pre-upstream audit call.
+	TimeoutMS int `yaml:"timeout-ms" json:"timeout-ms"`
+	// FailPolicy controls audit backend failures: "open" allows, "closed" blocks.
+	FailPolicy string `yaml:"fail-policy" json:"fail-policy"`
+	// SessionAuditInterval controls per-session audit cadence. Default: 5m.
+	SessionAuditInterval string `yaml:"session-audit-interval" json:"session-audit-interval"`
+	// SessionTTL controls in-memory session state retention. Default: 24h.
+	SessionTTL string `yaml:"session-ttl" json:"session-ttl"`
+	// BlockedSessionTTL controls how long a blocked session ID remains banned. Default: 168h.
+	BlockedSessionTTL string `yaml:"blocked-session-ttl" json:"blocked-session-ttl"`
+	// AllowSessionTTL controls how long a manual session allow override remains active. Default: 1h.
+	AllowSessionTTL string `yaml:"allow-session-ttl" json:"allow-session-ttl"`
+	// AsyncWorkers controls the async audit worker count for async_block mode. Default: 4.
+	AsyncWorkers int `yaml:"async-workers" json:"async-workers"`
+	// AsyncQueueSize controls the async audit queue size for async_block mode. Default: 1024.
+	AsyncQueueSize int `yaml:"async-queue-size" json:"async-queue-size"`
+	// AsyncRetryDelay controls retry backoff after async audit failures. Default: 30s.
+	AsyncRetryDelay string `yaml:"async-retry-delay" json:"async-retry-delay"`
+	// BlockThreshold is the minimum structured confidence required to enforce a block. Values below 0.97 are raised to 0.97.
+	BlockThreshold float64 `yaml:"block-threshold" json:"block-threshold"`
+	// MaxInputRunes is deprecated and ignored by risk control v2. Full user input is forwarded to audit.
+	MaxInputRunes int `yaml:"max-input-runes" json:"max-input-runes"`
+	// MaxInputImages is deprecated and ignored by risk control v2. All user image references are summarized.
+	MaxInputImages int `yaml:"max-input-images" json:"max-input-images"`
+	// BlockStatus is the downstream HTTP status for pre_block decisions. Default: 403.
+	BlockStatus int `yaml:"block-status" json:"block-status"`
+	// BlockMessage is the user-visible message for pre_block decisions.
+	BlockMessage string `yaml:"block-message" json:"block-message"`
+	// Prompt is deprecated and ignored. Risk control uses an internal OpenAI policy profile.
+	Prompt string `yaml:"prompt" json:"prompt"`
 }
 
 // TLSConfig holds HTTPS server settings.
@@ -620,7 +765,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		if optional {
 			if os.IsNotExist(err) || errors.Is(err, syscall.EISDIR) {
 				// Missing and optional: return empty config (cloud deploy standby).
-				return &Config{}, nil
+				cfg := &Config{}
+				cfg.NormalizePluginsConfig()
+				return cfg, nil
 			}
 		}
 		return nil, fmt.Errorf("failed to read config file: %w", err)
@@ -628,7 +775,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// In cloud deploy mode (optional=true), if file is empty or contains only whitespace, return empty config.
 	if optional && len(data) == 0 {
-		return &Config{}, nil
+		cfg := &Config{}
+		cfg.NormalizePluginsConfig()
+		return cfg, nil
 	}
 
 	// Unmarshal the YAML data into the Config struct.
@@ -649,7 +798,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
-			return &Config{}, nil
+			cfgOptional := &Config{}
+			cfgOptional.NormalizePluginsConfig()
+			return cfgOptional, nil
 		}
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
@@ -713,6 +864,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.MaxRetryCredentials = 0
 	}
 
+	cfg.NormalizePluginsConfig()
+
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
 
@@ -760,6 +913,20 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+// NormalizePluginsConfig applies default plugin configuration values.
+func (cfg *Config) NormalizePluginsConfig() {
+	if cfg == nil {
+		return
+	}
+	cfg.Plugins.Dir = strings.TrimSpace(cfg.Plugins.Dir)
+	if cfg.Plugins.Dir == "" {
+		cfg.Plugins.Dir = "plugins"
+	}
+	if cfg.Plugins.Configs == nil {
+		cfg.Plugins.Configs = map[string]PluginInstanceConfig{}
+	}
 }
 
 // SanitizePayloadRules validates raw JSON payload rule params and drops invalid rules.
@@ -1382,6 +1549,8 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 			return node.Value == DefaultPprofAddr
 		case "remote-management.panel-github-repository":
 			return node.Value == DefaultPanelGitHubRepository
+		case "plugins.dir":
+			return node.Value == "plugins"
 		case "routing.strategy":
 			return node.Value == "round-robin"
 		}
