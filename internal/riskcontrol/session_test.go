@@ -155,7 +155,7 @@ func TestSessionTrackerExpiresStaleSessionOnAccess(t *testing.T) {
 
 func TestSessionTrackerLoadsPersistedBlockedSessionAfterRestart(t *testing.T) {
 	filePath := filepath.Join(t.TempDir(), "risk-control-session-bans.json")
-	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC().Add(-time.Minute)
 	interval := 5 * time.Minute
 	ttl := time.Hour
 	blockedTTL := 7 * 24 * time.Hour
@@ -191,5 +191,79 @@ func TestSessionTrackerLoadsPersistedBlockedSessionAfterRestart(t *testing.T) {
 	}
 	if secondCalls != 0 {
 		t.Fatalf("persisted ban should skip audit, calls=%d", secondCalls)
+	}
+}
+
+func TestSessionTrackerAdmitAsyncSchedulesOnceAndCachesUntilInterval(t *testing.T) {
+	tracker := NewSessionTracker()
+	now := time.Unix(5000, 0)
+	interval := 5 * time.Minute
+	ttl := time.Hour
+
+	decision, source, scheduled := tracker.admitAsync("async-session", now, interval, ttl, false)
+	if source != DecisionSourceFreshAudit || !scheduled || decision.Blocked {
+		t.Fatalf("first async admit decision=%+v source=%q scheduled=%t, want fresh scheduled", decision, source, scheduled)
+	}
+
+	decision, source, scheduled = tracker.admitAsync("async-session", now.Add(time.Second), interval, ttl, false)
+	if scheduled || source != "" {
+		t.Fatalf("pending async admit source=%q scheduled=%t, want empty/false", source, scheduled)
+	}
+
+	tracker.completeAsyncAudit("async-session", now.Add(2*time.Second), ttl, 7*24*time.Hour, 30*time.Second, false, Decision{Reason: "ok"})
+
+	decision, source, scheduled = tracker.admitAsync("async-session", now.Add(time.Minute), interval, ttl, false)
+	if scheduled || source != DecisionSourceCache {
+		t.Fatalf("cached async admit source=%q scheduled=%t, want session_cache/false", source, scheduled)
+	}
+}
+
+func TestSessionTrackerAsyncCompletionAppliesBlockedBanWhenEnabled(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "risk-control-session-bans.json")
+	tracker := NewSessionTracker()
+	if err := tracker.ConfigurePersistence(filePath); err != nil {
+		t.Fatalf("ConfigurePersistence: %v", err)
+	}
+	now := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
+
+	_, source, scheduled := tracker.admitAsync("async-ban-session", now, 5*time.Minute, time.Hour, true)
+	if source != DecisionSourceFreshAudit || !scheduled {
+		t.Fatalf("source=%q scheduled=%t, want fresh scheduled", source, scheduled)
+	}
+
+	tracker.completeAsyncAudit("async-ban-session", now.Add(time.Second), time.Hour, 24*time.Hour, 30*time.Second, true, Decision{
+		Blocked: true,
+		Reason:  "blocked",
+	})
+
+	decision, source, scheduled := tracker.admitAsync("async-ban-session", now.Add(2*time.Second), 5*time.Minute, time.Hour, true)
+	if scheduled || source != DecisionSourceBlockedBan || !decision.Blocked {
+		t.Fatalf("decision=%+v source=%q scheduled=%t, want blocked ban", decision, source, scheduled)
+	}
+}
+
+func TestSessionTrackerAsyncFailuresUseRetryBackoff(t *testing.T) {
+	tracker := NewSessionTracker()
+	now := time.Unix(6000, 0)
+	ttl := time.Hour
+
+	_, source, scheduled := tracker.admitAsync("async-failure", now, 5*time.Minute, ttl, false)
+	if source != DecisionSourceFreshAudit || !scheduled {
+		t.Fatalf("source=%q scheduled=%t, want fresh scheduled", source, scheduled)
+	}
+
+	tracker.completeAsyncAudit("async-failure", now.Add(time.Second), ttl, 24*time.Hour, 30*time.Second, false, Decision{
+		Error:        "queue full",
+		FailureClass: "audit_enqueue_failed",
+	})
+
+	_, source, scheduled = tracker.admitAsync("async-failure", now.Add(10*time.Second), 5*time.Minute, ttl, false)
+	if source != "" || scheduled {
+		t.Fatalf("backoff admit source=%q scheduled=%t, want empty/false", source, scheduled)
+	}
+
+	_, source, scheduled = tracker.admitAsync("async-failure", now.Add(31*time.Second), 5*time.Minute, ttl, false)
+	if source != DecisionSourceFreshAudit || !scheduled {
+		t.Fatalf("retry admit source=%q scheduled=%t, want fresh scheduled", source, scheduled)
 	}
 }

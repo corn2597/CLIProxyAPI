@@ -271,8 +271,10 @@ type CodexConfig struct {
 type RiskControlConfig struct {
 	// Enabled toggles risk-control checks. When false, the feature is inert.
 	Enabled bool `yaml:"enabled" json:"enabled"`
-	// Mode controls enforcement: "off", "observe", "debug", or "pre_block".
+	// Mode controls enforcement: "off", "observe", "pre_block", or "async_block".
 	Mode string `yaml:"mode" json:"mode"`
+	// Debug enables shadow mode: audit/logging still runs, but no real ban is applied.
+	Debug bool `yaml:"debug" json:"debug"`
 	// BaseURL is an OpenAI-compatible API base URL, usually ending in /v1.
 	BaseURL string `yaml:"base-url" json:"base-url"`
 	// Endpoint selects the OpenAI-compatible endpoint. Default: "responses".
@@ -295,6 +297,12 @@ type RiskControlConfig struct {
 	BlockedSessionTTL string `yaml:"blocked-session-ttl" json:"blocked-session-ttl"`
 	// AllowSessionTTL controls how long a manual session allow override remains active. Default: 1h.
 	AllowSessionTTL string `yaml:"allow-session-ttl" json:"allow-session-ttl"`
+	// AsyncWorkers controls the async audit worker count for async_block mode. Default: 4.
+	AsyncWorkers int `yaml:"async-workers" json:"async-workers"`
+	// AsyncQueueSize controls the async audit queue size for async_block mode. Default: 1024.
+	AsyncQueueSize int `yaml:"async-queue-size" json:"async-queue-size"`
+	// AsyncRetryDelay controls retry backoff after async audit failures. Default: 30s.
+	AsyncRetryDelay string `yaml:"async-retry-delay" json:"async-retry-delay"`
 	// BlockThreshold is the minimum structured confidence required to enforce a block. Values below 0.97 are raised to 0.97.
 	BlockThreshold float64 `yaml:"block-threshold" json:"block-threshold"`
 	// MaxInputRunes is deprecated and ignored by risk control v2. Full user input is forwarded to audit.

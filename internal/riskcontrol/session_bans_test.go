@@ -10,7 +10,7 @@ func TestSessionBanStorePersistsBlockedSession(t *testing.T) {
 	t.Parallel()
 
 	filePath := filepath.Join(t.TempDir(), "risk-control-session-bans.json")
-	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC().Add(-time.Minute)
 	blockedUntil := now.Add(7 * 24 * time.Hour)
 
 	writer := NewSessionBanStore()
@@ -47,7 +47,7 @@ func TestSessionBanStoreDropsExpiredEntry(t *testing.T) {
 	t.Parallel()
 
 	filePath := filepath.Join(t.TempDir(), "risk-control-session-bans.json")
-	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC().Add(-2 * time.Minute)
 
 	store := NewSessionBanStore()
 	if err := store.ConfigurePersistence(filePath); err != nil {

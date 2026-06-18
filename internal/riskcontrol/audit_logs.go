@@ -45,7 +45,9 @@ type AuditLogEntry struct {
 	UserTextPreview   string    `json:"user_text_preview,omitempty"`
 	ImageReferences   []string  `json:"image_references,omitempty"`
 	Decision          string    `json:"decision"`
+	Debug             bool      `json:"debug,omitempty"`
 	Enforced          bool      `json:"enforced,omitempty"`
+	BanApplied        bool      `json:"ban_applied,omitempty"`
 	Blocked           bool      `json:"blocked,omitempty"`
 	ObserveOnly       bool      `json:"observe_only,omitempty"`
 	PolicyCode        string    `json:"policy_code,omitempty"`

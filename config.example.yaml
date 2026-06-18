@@ -162,7 +162,8 @@ codex:
 # audit the audit request. Only use this behind a trusted internal boundary.
 # risk-control:
 #   enabled: false
-#   mode: "observe"                 # off, observe, pre_block
+#   mode: "observe"                 # off, observe, pre_block, async_block
+#   debug: false                    # when true, keep audit/logging but skip real bans
 #   base-url: "https://api.example.com/v1"
 #   endpoint: "responses"           # responses (recommended), chat-completions, or moderations
 #   model: "audit-model"
@@ -172,6 +173,9 @@ codex:
 #   session-ttl: "24h"
 #   blocked-session-ttl: "168h"     # blacklist a blocked session_id for 7 days
 #   allow-session-ttl: "1h"         # manual allow-session override lifetime
+#   async-workers: 4                # async_block worker count
+#   async-queue-size: 1024          # async_block queue size
+#   async-retry-delay: "30s"        # retry backoff after async audit failures
 #   block-threshold: 0.97             # values below 0.97 are raised to 0.97
 #   timeout-ms: 3000
 #   fail-policy: "open"             # open or closed

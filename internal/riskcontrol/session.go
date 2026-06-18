@@ -32,6 +32,9 @@ type sessionState struct {
 	lastSeenAt   time.Time
 	lastAuditAt  time.Time
 	blockedUntil time.Time
+	retryAfter   time.Time
+	pendingSince time.Time
+	auditPending bool
 	lastDecision Decision
 }
 
@@ -164,6 +167,80 @@ func (t *SessionTracker) evaluateWithBlockedBans(sessionID string, now time.Time
 	}
 	state.lastDecision = decision
 	return decision, DecisionSourceFreshAudit
+}
+
+func (t *SessionTracker) admitAsync(sessionID string, now time.Time, interval time.Duration, ttl time.Duration, useBlockedBans bool) (Decision, string, bool) {
+	state := t.state(sessionID, now, ttl)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.lastSeenAt = now
+
+	if useBlockedBans && !state.blockedUntil.IsZero() {
+		if now.Before(state.blockedUntil) {
+			return state.lastDecision, DecisionSourceBlockedBan, false
+		}
+		state.blockedUntil = time.Time{}
+	}
+	if useBlockedBans {
+		if decision, ok := t.loadPersistedBlockedDecision(sessionID, now, state); ok {
+			return decision, DecisionSourceBlockedBan, false
+		}
+	} else {
+		state.blockedUntil = time.Time{}
+	}
+
+	if state.auditPending {
+		return Decision{}, "", false
+	}
+	if !state.retryAfter.IsZero() && now.Before(state.retryAfter) {
+		return Decision{}, "", false
+	}
+	due := state.lastAuditAt.IsZero() || now.Sub(state.lastAuditAt) >= interval
+	if !due {
+		return state.lastDecision, DecisionSourceCache, false
+	}
+	state.auditPending = true
+	state.pendingSince = now
+	return Decision{}, DecisionSourceFreshAudit, true
+}
+
+func (t *SessionTracker) completeAsyncAudit(sessionID string, now time.Time, ttl time.Duration, blockedTTL time.Duration, retryDelay time.Duration, applyBlockedBans bool, decision Decision) {
+	state := t.state(sessionID, now, ttl)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	state.lastSeenAt = now
+	state.auditPending = false
+	state.pendingSince = time.Time{}
+	decision.Audited = true
+	state.lastDecision = decision
+
+	if decision.Error != "" || decision.FailureClass != "" {
+		if retryDelay > 0 {
+			state.retryAfter = now.Add(retryDelay)
+		} else {
+			state.retryAfter = time.Time{}
+		}
+		return
+	}
+
+	state.retryAfter = time.Time{}
+	state.lastAuditAt = now
+
+	if applyBlockedBans && decision.Blocked && blockedTTL > 0 {
+		state.blockedUntil = now.Add(blockedTTL)
+		if err := t.upsertPersistedBan(sessionID, state.blockedUntil, decision.Reason, now); err != nil {
+			log.WithError(err).WithField("session_id", sessionID).Warn("risk control: failed to persist blocked session")
+		}
+		return
+	}
+
+	state.blockedUntil = time.Time{}
+	if applyBlockedBans {
+		if err := t.deletePersistedBan(sessionID); err != nil {
+			log.WithError(err).WithField("session_id", sessionID).Warn("risk control: failed to clear blocked session persistence")
+		}
+	}
 }
 
 func (t *SessionTracker) loadPersistedBlockedDecision(sessionID string, now time.Time, state *sessionState) (Decision, bool) {

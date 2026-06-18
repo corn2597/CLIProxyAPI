@@ -571,14 +571,16 @@ const riskControlPageHTML = `<!DOCTYPE html>
             <button id="observeBlockBtn" class="warn hidden" disabled>BLOCK</button>
           </div>
 
-          <div class="detail-grid">
-            <div><strong>Session ID</strong><div id="detailSession">-</div></div>
-            <div><strong>Decision source</strong><div id="detailDecisionSource">-</div></div>
-            <div><strong>Policy code</strong><div id="detailPolicy">-</div></div>
-            <div><strong>Subcategory</strong><div id="detailSubcategory">-</div></div>
-            <div><strong>Confidence</strong><div id="detailConfidence">-</div></div>
-            <div><strong>Authorized context</strong><div id="detailAuthorized">-</div></div>
-          </div>
+	          <div class="detail-grid">
+	            <div><strong>Session ID</strong><div id="detailSession">-</div></div>
+	            <div><strong>Decision source</strong><div id="detailDecisionSource">-</div></div>
+	            <div><strong>Mode</strong><div id="detailMode">-</div></div>
+	            <div><strong>Ban applied</strong><div id="detailBanApplied">-</div></div>
+	            <div><strong>Policy code</strong><div id="detailPolicy">-</div></div>
+	            <div><strong>Subcategory</strong><div id="detailSubcategory">-</div></div>
+	            <div><strong>Confidence</strong><div id="detailConfidence">-</div></div>
+	            <div><strong>Authorized context</strong><div id="detailAuthorized">-</div></div>
+	          </div>
 
           <div class="section">
             <strong>Evidence</strong>
@@ -603,11 +605,13 @@ const riskControlPageHTML = `<!DOCTYPE html>
     var rowsEl = document.getElementById('rows');
     var statusEl = document.getElementById('status');
     var countLabelEl = document.getElementById('countLabel');
-    var selectedIDEl = document.getElementById('selectedID');
-    var detailSessionEl = document.getElementById('detailSession');
-    var detailDecisionSourceEl = document.getElementById('detailDecisionSource');
-    var detailPolicyEl = document.getElementById('detailPolicy');
-    var detailSubcategoryEl = document.getElementById('detailSubcategory');
+	    var selectedIDEl = document.getElementById('selectedID');
+	    var detailSessionEl = document.getElementById('detailSession');
+	    var detailDecisionSourceEl = document.getElementById('detailDecisionSource');
+	    var detailModeEl = document.getElementById('detailMode');
+	    var detailBanAppliedEl = document.getElementById('detailBanApplied');
+	    var detailPolicyEl = document.getElementById('detailPolicy');
+	    var detailSubcategoryEl = document.getElementById('detailSubcategory');
     var detailConfidenceEl = document.getElementById('detailConfidence');
     var detailAuthorizedEl = document.getElementById('detailAuthorized');
     var detailEvidenceEl = document.getElementById('detailEvidence');
@@ -680,15 +684,17 @@ const riskControlPageHTML = `<!DOCTYPE html>
       loadOlderBtn.disabled = !hasMore;
     }
 
-    function renderDetail() {
-      var item = selected;
-      selectedIDEl.textContent = item ? String(item.id) : 'none';
-      detailSessionEl.textContent = item ? (item.session_id || '-') : '-';
-      detailDecisionSourceEl.textContent = item ? (item.decision_source || '-') : '-';
-      detailPolicyEl.textContent = item ? (item.policy_code || '-') : '-';
-      detailSubcategoryEl.textContent = item ? (item.subcategory_code || '-') : '-';
-      detailConfidenceEl.textContent = item ? formatConfidence(item.confidence) : '-';
-      detailAuthorizedEl.textContent = item ? (item.authorized_context || '-') : '-';
+	    function renderDetail() {
+	      var item = selected;
+	      selectedIDEl.textContent = item ? String(item.id) : 'none';
+	      detailSessionEl.textContent = item ? (item.session_id || '-') : '-';
+	      detailDecisionSourceEl.textContent = item ? (item.decision_source || '-') : '-';
+	      detailModeEl.textContent = item ? formatModeLabel(item) : '-';
+	      detailBanAppliedEl.textContent = item ? formatBanApplied(item) : '-';
+	      detailPolicyEl.textContent = item ? (item.policy_code || '-') : '-';
+	      detailSubcategoryEl.textContent = item ? (item.subcategory_code || '-') : '-';
+	      detailConfidenceEl.textContent = item ? formatConfidence(item.confidence) : '-';
+	      detailAuthorizedEl.textContent = item ? (item.authorized_context || '-') : '-';
       detailEvidenceEl.textContent = item && item.evidence && item.evidence.length ? item.evidence.join('\n') : '-';
       detailInputEl.textContent = item ? (item.user_text_preview || '-') : '-';
       detailRawEl.textContent = item ? (item.raw_audit_response || '-') : '-';
@@ -710,12 +716,28 @@ const riskControlPageHTML = `<!DOCTYPE html>
       renderRows();
     }
 
-    function formatConfidence(value) {
-      if (typeof value !== 'number') {
-        return '-';
-      }
-      return value.toFixed(2);
-    }
+	    function formatConfidence(value) {
+	      if (typeof value !== 'number') {
+	        return '-';
+	      }
+	      return value.toFixed(2);
+	    }
+
+	    function formatModeLabel(item) {
+	      if (!item) return '-';
+	      var mode = item.mode || '-';
+	      if (item.debug) {
+	        mode += ' (debug)';
+	      }
+	      return mode;
+	    }
+
+	    function formatBanApplied(item) {
+	      if (!item) return '-';
+	      if (item.ban_applied === true) return 'yes';
+	      if (item.debug && (item.blocked || item.decision === 'block')) return 'shadow only';
+	      return 'no';
+	    }
 
     function escapeHTML(value) {
       return String(value || '')

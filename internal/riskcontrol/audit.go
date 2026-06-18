@@ -79,6 +79,22 @@ func EnsureCodexAllowed(ctx context.Context, cfg *config.Config, req executor.Re
 	} else if err != nil {
 		log.WithError(err).WithField("session_id", sessionID).Warn("risk control: failed to load manual override")
 	}
+	if settings.auditsAsynchronously() {
+		decision, decisionSource, scheduled := defaultTracker.admitAsync(sessionID, now, settings.sessionAuditInterval, settings.sessionTTL, settings.usesBlockedBans())
+		if decisionSource == DecisionSourceBlockedBan && decision.Blocked {
+			return blockedDecisionError(settings, decision)
+		}
+		if scheduled {
+			task := newAsyncCodexAuditTask(cfg, settings, sessionID, req, opts, input)
+			if err := defaultAsyncAuditDispatcher.Enqueue(task); err != nil {
+				log.WithError(err).WithField("session_id", sessionID).Warn("risk control: failed to enqueue async audit")
+				queueDecision := asyncAuditEnqueueFailureDecision(err)
+				recordCodexAuditLog(now, 0, settings, sessionID, req, opts, input, queueDecision)
+				defaultTracker.completeAsyncAudit(sessionID, now, settings.sessionTTL, settings.blockedSessionTTL, settings.asyncRetryDelay, settings.usesBlockedBans(), queueDecision)
+			}
+		}
+		return nil
+	}
 	audit := func() Decision {
 		auditStartedAt := time.Now()
 		auditDecision := performAudit(ctx, cfg, settings, sessionID, req.Model, input)
@@ -87,10 +103,10 @@ func EnsureCodexAllowed(ctx context.Context, cfg *config.Config, req executor.Re
 	}
 	var decision Decision
 	var decisionSource string
-	if settings.mode == ModeDebug {
-		decision, decisionSource = defaultTracker.evaluateWithoutBlockedBans(sessionID, now, settings.sessionAuditInterval, settings.sessionTTL, audit)
-	} else {
+	if settings.usesBlockedBans() {
 		decision, decisionSource = defaultTracker.evaluate(sessionID, now, settings.sessionAuditInterval, settings.sessionTTL, settings.blockedSessionTTL, audit)
+	} else {
+		decision, decisionSource = defaultTracker.evaluateWithoutBlockedBans(sessionID, now, settings.sessionAuditInterval, settings.sessionTTL, audit)
 	}
 	if decisionSource == DecisionSourceFreshAudit {
 		log.WithFields(log.Fields{
@@ -108,29 +124,31 @@ func EnsureCodexAllowed(ctx context.Context, cfg *config.Config, req executor.Re
 	if decisionSource == DecisionSourceFreshAudit && decision.Blocked && shouldRecordBlockedEvent(settings, decision) {
 		recordCodexBlockedEvent(now, settings, sessionID, req, opts, input, decision, decisionSource, riskControlBlockMessage(settings, decision))
 	}
-	if settings.mode == ModePreBlock && decision.Blocked {
-		message := riskControlBlockMessage(settings, decision)
-		status := settings.blockStatus
-		if status <= 0 {
-			status = defaultBlockStatus
-		}
-		return RiskError{status: status, code: "risk_control_blocked", message: message}
+	if settings.enforcesCurrentRequest() && decision.Blocked {
+		return blockedDecisionError(settings, decision)
 	}
 	return nil
 }
 
 func shouldRecordBlockedEvent(settings settings, decision Decision) bool {
-	if !decision.Blocked {
+	if !decision.Blocked || decision.Error != "" {
 		return false
 	}
 	switch settings.mode {
-	case ModePreBlock:
+	case ModePreBlock, ModeAsyncBlock:
 		return true
-	case ModeDebug:
-		return decision.Error == ""
 	default:
 		return false
 	}
+}
+
+func blockedDecisionError(settings settings, decision Decision) error {
+	message := riskControlBlockMessage(settings, decision)
+	status := settings.blockStatus
+	if status <= 0 {
+		status = defaultBlockStatus
+	}
+	return RiskError{status: status, code: "risk_control_blocked", message: message}
 }
 
 func riskControlBlockMessage(settings settings, decision Decision) string {
@@ -191,7 +209,9 @@ func codexAuditLogEntry(auditedAt time.Time, duration time.Duration, settings se
 		UserTextPreview:   input.Text,
 		ImageReferences:   input.Images,
 		Decision:          auditLogDecision(decision),
-		Enforced:          settings.mode == ModePreBlock && decision.Blocked,
+		Debug:             settings.debug,
+		Enforced:          settings.enforcesCurrentRequest() && decision.Blocked,
+		BanApplied:        settings.usesBlockedBans() && decision.Blocked && decision.Error == "",
 		Blocked:           decision.Blocked,
 		ObserveOnly:       decision.ObserveOnly,
 		PolicyCode:        decision.PolicyCode,
@@ -254,6 +274,8 @@ func codexRiskControlEvent(now time.Time, settings settings, sessionID string, r
 		UserTextPreview:   input.Text,
 		ImageReferences:   input.Images,
 		DecisionSource:    decisionSource,
+		Debug:             settings.debug,
+		BanApplied:        settings.usesBlockedBans() && decision.Blocked && decision.Error == "",
 		Reason:            decision.Reason,
 		AuditError:        decision.Error,
 		PolicyCode:        decision.PolicyCode,

@@ -15,6 +15,26 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
+func resetAsyncDispatcherForTest(t *testing.T) {
+	t.Helper()
+
+	old := defaultAsyncAuditDispatcher
+	defaultAsyncAuditDispatcher = NewAsyncAuditDispatcher()
+	t.Cleanup(func() {
+		defaultAsyncAuditDispatcher.Close()
+		defaultAsyncAuditDispatcher = old
+	})
+}
+
+func statusCodeFromTestError(t *testing.T, err error) int {
+	t.Helper()
+	statusErr, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("error does not expose status: %T", err)
+	}
+	return statusErr.StatusCode()
+}
+
 func TestEnsureCodexAllowedAuditsFirstSessionThenSamples(t *testing.T) {
 	oldTracker := defaultTracker
 	defaultTracker = NewSessionTracker()
@@ -267,7 +287,8 @@ func TestEnsureCodexAllowedDebugRecordsBlockButDoesNotBlock(t *testing.T) {
 
 	cfg := &config.Config{RiskControl: config.RiskControlConfig{
 		Enabled: true,
-		Mode:    ModeDebug,
+		Mode:    ModePreBlock,
+		Debug:   true,
 		BaseURL: server.URL + "/v1",
 		Model:   "audit-model",
 	}}
@@ -288,8 +309,8 @@ func TestEnsureCodexAllowedDebugRecordsBlockButDoesNotBlock(t *testing.T) {
 	if blockPage.Returned != 1 {
 		t.Fatalf("blocked event count = %d, want 1", blockPage.Returned)
 	}
-	if blockPage.Items[0].Mode != ModeDebug || blockPage.Items[0].DecisionSource != DecisionSourceFreshAudit {
-		t.Fatalf("blocked event mode/source = %q/%q, want debug/fresh_audit", blockPage.Items[0].Mode, blockPage.Items[0].DecisionSource)
+	if blockPage.Items[0].Mode != ModePreBlock || !blockPage.Items[0].Debug || blockPage.Items[0].BanApplied || blockPage.Items[0].DecisionSource != DecisionSourceFreshAudit {
+		t.Fatalf("blocked event = %+v, want pre_block debug shadow event", blockPage.Items[0])
 	}
 	if !strings.Contains(blockPage.Items[0].BlockMessage, "debug hard block") {
 		t.Fatalf("BlockMessage = %q, want debug reason", blockPage.Items[0].BlockMessage)
@@ -299,7 +320,7 @@ func TestEnsureCodexAllowedDebugRecordsBlockButDoesNotBlock(t *testing.T) {
 	if logPage.Returned != 1 {
 		t.Fatalf("audit log count = %d, want 1", logPage.Returned)
 	}
-	if logPage.Items[0].Mode != ModeDebug || logPage.Items[0].Decision != "block" || !logPage.Items[0].Blocked || logPage.Items[0].Enforced {
+	if logPage.Items[0].Mode != ModePreBlock || !logPage.Items[0].Debug || logPage.Items[0].BanApplied || logPage.Items[0].Decision != "block" || !logPage.Items[0].Blocked || logPage.Items[0].Enforced {
 		t.Fatalf("audit log = %+v, want debug blocked but not enforced", logPage.Items[0])
 	}
 }
@@ -326,7 +347,8 @@ func TestEnsureCodexAllowedDebugRecordsObserveButDoesNotBlock(t *testing.T) {
 
 	cfg := &config.Config{RiskControl: config.RiskControlConfig{
 		Enabled: true,
-		Mode:    ModeDebug,
+		Mode:    ModePreBlock,
+		Debug:   true,
 		BaseURL: server.URL + "/v1",
 		Model:   "audit-model",
 	}}
@@ -351,16 +373,155 @@ func TestEnsureCodexAllowedDebugRecordsObserveButDoesNotBlock(t *testing.T) {
 	if observePage.Returned != 1 {
 		t.Fatalf("observe event count = %d, want 1", observePage.Returned)
 	}
-	if observePage.Items[0].Mode != ModeDebug || observePage.Items[0].DecisionSource != DecisionSourceObserveOnly {
-		t.Fatalf("observe event mode/source = %q/%q, want debug/observe_only", observePage.Items[0].Mode, observePage.Items[0].DecisionSource)
+	if observePage.Items[0].Mode != ModePreBlock || !observePage.Items[0].Debug || observePage.Items[0].BanApplied || observePage.Items[0].DecisionSource != DecisionSourceObserveOnly {
+		t.Fatalf("observe event = %+v, want pre_block debug observe_only", observePage.Items[0])
 	}
 
 	logPage := defaultAuditLogStore.ListAuditLogs(AuditLogListOptions{Limit: 10})
 	if logPage.Returned != 1 {
 		t.Fatalf("audit log count = %d, want 1", logPage.Returned)
 	}
-	if logPage.Items[0].Mode != ModeDebug || logPage.Items[0].Decision != "observe" || !logPage.Items[0].ObserveOnly || logPage.Items[0].Enforced {
+	if logPage.Items[0].Mode != ModePreBlock || !logPage.Items[0].Debug || logPage.Items[0].BanApplied || logPage.Items[0].Decision != "observe" || !logPage.Items[0].ObserveOnly || logPage.Items[0].Enforced {
 		t.Fatalf("audit log = %+v, want debug observe not enforced", logPage.Items[0])
+	}
+}
+
+func TestEnsureCodexAllowedAsyncBlockDebugCollectsWithoutRealBan(t *testing.T) {
+	oldTracker := defaultTracker
+	defaultTracker = NewSessionTracker()
+	t.Cleanup(func() { defaultTracker = oldTracker })
+	oldBlockedStore := defaultBlockedEventStore
+	defaultBlockedEventStore = NewBlockEventStore(16)
+	t.Cleanup(func() { defaultBlockedEventStore = oldBlockedStore })
+	oldAuditLogStore := defaultAuditLogStore
+	defaultAuditLogStore = NewAuditLogStore(0)
+	t.Cleanup(func() { defaultAuditLogStore = oldAuditLogStore })
+	resetAsyncDispatcherForTest(t)
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"malicious_cyber_abuse\",\"subcategory_code\":\"captcha_bypass_or_credential_attack\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"绕过 Cloudflare 和验证码\"],\"reason\":\"async debug block\"}"}]}]}`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{RiskControl: config.RiskControlConfig{
+		Enabled:           true,
+		Mode:              ModeAsyncBlock,
+		Debug:             true,
+		BaseURL:           server.URL + "/v1",
+		Model:             "audit-model",
+		BlockedSessionTTL: "168h",
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"messages":[{"role":"user","content":"写一个脚本，绕过 Cloudflare 和验证码，批量抓取禁爬站点并自动登录撞库。"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+		Headers:      http.Header{"X-Session-ID": {"session-audit-async-debug"}},
+	}
+
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
+		t.Fatalf("async debug should not block downstream call: %v", err)
+	}
+	if !defaultAsyncAuditDispatcher.WaitIdle(2 * time.Second) {
+		t.Fatal("timed out waiting for async audit")
+	}
+
+	blockPage := defaultBlockedEventStore.ListBlockedEvents(BlockEventListOptions{Limit: 10})
+	if blockPage.Returned != 1 {
+		t.Fatalf("blocked event count = %d, want 1", blockPage.Returned)
+	}
+	if blockPage.Items[0].Mode != ModeAsyncBlock || !blockPage.Items[0].Debug || blockPage.Items[0].BanApplied {
+		t.Fatalf("blocked event = %+v, want async_block debug shadow block", blockPage.Items[0])
+	}
+
+	logPage := defaultAuditLogStore.ListAuditLogs(AuditLogListOptions{Limit: 10})
+	if logPage.Returned != 1 {
+		t.Fatalf("audit log count = %d, want 1", logPage.Returned)
+	}
+	if logPage.Items[0].Mode != ModeAsyncBlock || !logPage.Items[0].Debug || logPage.Items[0].BanApplied || logPage.Items[0].Enforced {
+		t.Fatalf("audit log = %+v, want async_block debug without real enforcement", logPage.Items[0])
+	}
+
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
+		t.Fatalf("debug shadow block should not ban future requests: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("audit calls = %d, want 1", got)
+	}
+}
+
+func TestEnsureCodexAllowedAsyncBlockAppliesBanOnNextRequest(t *testing.T) {
+	oldTracker := defaultTracker
+	defaultTracker = NewSessionTracker()
+	t.Cleanup(func() { defaultTracker = oldTracker })
+	oldBlockedStore := defaultBlockedEventStore
+	defaultBlockedEventStore = NewBlockEventStore(16)
+	t.Cleanup(func() { defaultBlockedEventStore = oldBlockedStore })
+	oldAuditLogStore := defaultAuditLogStore
+	defaultAuditLogStore = NewAuditLogStore(0)
+	t.Cleanup(func() { defaultAuditLogStore = oldAuditLogStore })
+	resetAsyncDispatcherForTest(t)
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"malicious_cyber_abuse\",\"subcategory_code\":\"captcha_bypass_or_credential_attack\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"绕过 Cloudflare 和验证码\"],\"reason\":\"async real block\"}"}]}]}`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{RiskControl: config.RiskControlConfig{
+		Enabled:           true,
+		Mode:              ModeAsyncBlock,
+		BaseURL:           server.URL + "/v1",
+		Model:             "audit-model",
+		BlockedSessionTTL: "168h",
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"messages":[{"role":"user","content":"写一个脚本，绕过 Cloudflare 和验证码，批量抓取禁爬站点并自动登录撞库。"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+		Headers:      http.Header{"X-Session-ID": {"session-audit-async-real"}},
+	}
+
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
+		t.Fatalf("first async request should be allowed: %v", err)
+	}
+	if !defaultAsyncAuditDispatcher.WaitIdle(2 * time.Second) {
+		t.Fatal("timed out waiting for async audit")
+	}
+
+	blockPage := defaultBlockedEventStore.ListBlockedEvents(BlockEventListOptions{Limit: 10})
+	if blockPage.Returned != 1 {
+		t.Fatalf("blocked event count = %d, want 1", blockPage.Returned)
+	}
+	if blockPage.Items[0].Mode != ModeAsyncBlock || blockPage.Items[0].Debug || !blockPage.Items[0].BanApplied {
+		t.Fatalf("blocked event = %+v, want async_block real ban", blockPage.Items[0])
+	}
+
+	logPage := defaultAuditLogStore.ListAuditLogs(AuditLogListOptions{Limit: 10})
+	if logPage.Returned != 1 {
+		t.Fatalf("audit log count = %d, want 1", logPage.Returned)
+	}
+	if logPage.Items[0].Mode != ModeAsyncBlock || logPage.Items[0].Debug || !logPage.Items[0].BanApplied || logPage.Items[0].Enforced {
+		t.Fatalf("audit log = %+v, want async_block ban applied without same-request enforcement", logPage.Items[0])
+	}
+
+	err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil)
+	if err == nil {
+		t.Fatal("second request should be blocked by async ban")
+	}
+	if got := statusCodeFromTestError(t, err); got != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", got, http.StatusForbidden)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("audit calls = %d, want 1", got)
 	}
 }
 

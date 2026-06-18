@@ -45,6 +45,8 @@ type BlockEvent struct {
 	UserTextPreview   string    `json:"user_text_preview,omitempty"`
 	ImageReferences   []string  `json:"image_references,omitempty"`
 	DecisionSource    string    `json:"decision_source,omitempty"`
+	Debug             bool      `json:"debug,omitempty"`
+	BanApplied        bool      `json:"ban_applied,omitempty"`
 	Reason            string    `json:"reason,omitempty"`
 	AuditError        string    `json:"audit_error,omitempty"`
 	BlockMessage      string    `json:"block_message,omitempty"`

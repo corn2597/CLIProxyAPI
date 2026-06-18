@@ -9,10 +9,11 @@ import (
 )
 
 const (
-	ModeOff      = "off"
-	ModeObserve  = "observe"
-	ModeDebug    = "debug"
-	ModePreBlock = "pre_block"
+	ModeOff        = "off"
+	ModeObserve    = "observe"
+	ModeDebug      = "debug"
+	ModePreBlock   = "pre_block"
+	ModeAsyncBlock = "async_block"
 
 	FailOpen   = "open"
 	FailClosed = "closed"
@@ -26,6 +27,9 @@ const (
 	defaultSessionAuditInterval = 5 * time.Minute
 	defaultSessionTTL           = 24 * time.Hour
 	defaultBlockedSessionTTL    = 7 * 24 * time.Hour
+	defaultAsyncWorkers         = 4
+	defaultAsyncQueueSize       = 1024
+	defaultAsyncRetryDelay      = 30 * time.Second
 	defaultBlockThreshold       = 0.97
 	defaultMaxInputRunes        = 0
 	defaultMaxInputImages       = 0
@@ -36,6 +40,7 @@ const (
 type settings struct {
 	enabled              bool
 	mode                 string
+	debug                bool
 	baseURL              string
 	endpoint             string
 	model                string
@@ -45,6 +50,9 @@ type settings struct {
 	sessionAuditInterval time.Duration
 	sessionTTL           time.Duration
 	blockedSessionTTL    time.Duration
+	asyncWorkers         int
+	asyncQueueSize       int
+	asyncRetryDelay      time.Duration
 	blockThreshold       float64
 	maxInputRunes        int
 	maxInputImages       int
@@ -58,13 +66,17 @@ func normalizeSettings(cfg *config.Config) settings {
 	}
 	raw := cfg.RiskControl
 	mode := strings.ToLower(strings.TrimSpace(raw.Mode))
+	debug := raw.Debug
 	switch mode {
 	case "", ModeObserve:
 		mode = ModeObserve
 	case "dry-run", "dry_run", ModeDebug:
-		mode = ModeDebug
+		mode = ModePreBlock
+		debug = true
 	case "pre-block", "preblock", ModePreBlock:
 		mode = ModePreBlock
+	case "async-block", "asyncblock", ModeAsyncBlock:
+		mode = ModeAsyncBlock
 	case ModeOff:
 		mode = ModeOff
 	default:
@@ -123,10 +135,19 @@ func normalizeSettings(cfg *config.Config) settings {
 	if maxImages <= 0 {
 		maxImages = defaultMaxInputImages
 	}
+	asyncWorkers := raw.AsyncWorkers
+	if asyncWorkers <= 0 {
+		asyncWorkers = defaultAsyncWorkers
+	}
+	asyncQueueSize := raw.AsyncQueueSize
+	if asyncQueueSize <= 0 {
+		asyncQueueSize = defaultAsyncQueueSize
+	}
 
 	return settings{
 		enabled:              true,
 		mode:                 mode,
+		debug:                debug,
 		baseURL:              strings.TrimSpace(raw.BaseURL),
 		endpoint:             endpoint,
 		model:                strings.TrimSpace(raw.Model),
@@ -136,12 +157,35 @@ func normalizeSettings(cfg *config.Config) settings {
 		sessionAuditInterval: parsePositiveDuration(raw.SessionAuditInterval, defaultSessionAuditInterval),
 		sessionTTL:           parsePositiveDuration(raw.SessionTTL, defaultSessionTTL),
 		blockedSessionTTL:    parsePositiveDuration(raw.BlockedSessionTTL, defaultBlockedSessionTTL),
+		asyncWorkers:         asyncWorkers,
+		asyncQueueSize:       asyncQueueSize,
+		asyncRetryDelay:      parsePositiveDuration(raw.AsyncRetryDelay, defaultAsyncRetryDelay),
 		blockThreshold:       blockThreshold,
 		maxInputRunes:        maxRunes,
 		maxInputImages:       maxImages,
 		blockStatus:          blockStatus,
 		blockMessage:         blockMessage,
 	}
+}
+
+func (s settings) usesBlockedBans() bool {
+	if s.debug {
+		return false
+	}
+	switch s.mode {
+	case ModePreBlock, ModeAsyncBlock:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s settings) enforcesCurrentRequest() bool {
+	return !s.debug && s.mode == ModePreBlock
+}
+
+func (s settings) auditsAsynchronously() bool {
+	return s.mode == ModeAsyncBlock
 }
 
 func normalizeEndpoint(raw string) string {
