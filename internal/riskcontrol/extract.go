@@ -120,7 +120,7 @@ func collectUserTurns(format sdktranslator.Format, payload []byte) []auditTurn {
 		return collectResponsesUserTurns(gjson.GetBytes(payload, "input"))
 	case sdktranslator.FormatClaude.String():
 		return collectRoleMessageTurns(gjson.GetBytes(payload, "messages"), "user")
-	case sdktranslator.FormatGemini.String(), sdktranslator.FormatGeminiCLI.String():
+	case sdktranslator.FormatGemini.String(), "gemini-cli":
 		return collectGeminiUserTurns(gjson.GetBytes(payload, "contents"))
 	default:
 		var turns []auditTurn

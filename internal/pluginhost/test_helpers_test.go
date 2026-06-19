@@ -22,11 +22,11 @@ func newTestSymbolLoader() *testSymbolLoader {
 	return &testSymbolLoader{lookups: make(map[string]*testSymbolLookup)}
 }
 
-func (l *testSymbolLoader) Open(path string, host *Host) (pluginClient, error) {
+func (l *testSymbolLoader) Open(file pluginFile, host *Host) (pluginClient, error) {
 	l.openCalls++
-	lookup := l.lookups[pluginIDFromPath(path)]
+	lookup := l.lookups[file.ID]
 	if lookup == nil {
-		return nil, fmt.Errorf("missing test plugin for %s", path)
+		return nil, fmt.Errorf("missing test plugin for %s", file.Path)
 	}
 	return lookup, nil
 }
@@ -34,8 +34,11 @@ func (l *testSymbolLoader) Open(path string, host *Host) (pluginClient, error) {
 type testSymbolLookup struct {
 	plugin              *testPlugin
 	active              pluginapi.Plugin
+	shutdownCalls       int
 	registerOverride    func([]byte) pluginapi.Plugin
 	reconfigureOverride func([]byte) pluginapi.Plugin
+	schemaVersion       uint32
+	lastLifecycle       rpcLifecycleRequest
 }
 
 func newTestSymbolLookup(plugin *testPlugin) *testSymbolLookup {
@@ -71,7 +74,20 @@ func (l *testSymbolLookup) Call(ctx context.Context, method string, request []by
 		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
 			return nil, errUnmarshal
 		}
-		resp, errIntercept := l.active.Capabilities.RequestInterceptor.InterceptRequest(ctx, req)
+		resp, errIntercept := l.active.Capabilities.RequestInterceptor.InterceptRequestBeforeAuth(ctx, req)
+		if errIntercept != nil {
+			return nil, errIntercept
+		}
+		return marshalRPCResult(resp)
+	case pluginabi.MethodRequestInterceptAfter:
+		if l.active.Capabilities.RequestInterceptor == nil {
+			return nil, fmt.Errorf("missing request interceptor")
+		}
+		var req pluginapi.RequestInterceptRequest
+		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+		resp, errIntercept := l.active.Capabilities.RequestInterceptor.InterceptRequestAfterAuth(ctx, req)
 		if errIntercept != nil {
 			return nil, errIntercept
 		}
@@ -120,6 +136,19 @@ func (l *testSymbolLookup) Call(ctx context.Context, method string, request []by
 			return nil, errPick
 		}
 		return marshalRPCResult(resp)
+	case pluginabi.MethodModelRoute:
+		if l.active.Capabilities.ModelRouter == nil {
+			return nil, fmt.Errorf("missing model router")
+		}
+		var req pluginapi.ModelRouteRequest
+		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+		resp, errRoute := l.active.Capabilities.ModelRouter.RouteModel(ctx, req)
+		if errRoute != nil {
+			return nil, errRoute
+		}
+		return marshalRPCResult(resp)
 	case pluginabi.MethodUsageHandle:
 		if l.active.Capabilities.UsagePlugin == nil {
 			return marshalRPCResult(rpcEmptyResponse{})
@@ -135,13 +164,16 @@ func (l *testSymbolLookup) Call(ctx context.Context, method string, request []by
 	}
 }
 
-func (l *testSymbolLookup) Shutdown() {}
+func (l *testSymbolLookup) Shutdown() {
+	l.shutdownCalls++
+}
 
 func (l *testSymbolLookup) callLifecycle(request []byte, reload bool) ([]byte, error) {
 	var req rpcLifecycleRequest
 	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
+	l.lastLifecycle = req
 	var plugin pluginapi.Plugin
 	if reload {
 		if l.reconfigureOverride != nil {
@@ -157,8 +189,12 @@ func (l *testSymbolLookup) callLifecycle(request []byte, reload bool) ([]byte, e
 		}
 	}
 	l.active = plugin
+	schemaVersion := l.schemaVersion
+	if schemaVersion == 0 {
+		schemaVersion = pluginabi.SchemaVersion
+	}
 	return marshalRPCResult(rpcRegistration{
-		SchemaVersion: pluginabi.SchemaVersion,
+		SchemaVersion: schemaVersion,
 		Metadata:      plugin.Metadata,
 		Capabilities:  rpcCapabilitiesFromPlugin(plugin),
 	})
@@ -231,7 +267,14 @@ func (c testThinkingCapability) ApplyThinking(ctx context.Context, req pluginapi
 
 type requestInterceptorFunc func(context.Context, pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error)
 
-func (f requestInterceptorFunc) InterceptRequest(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+func (f requestInterceptorFunc) InterceptRequestBeforeAuth(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
+	if f == nil {
+		return pluginapi.RequestInterceptResponse{}, fmt.Errorf("missing request interceptor callback")
+	}
+	return f(ctx, req)
+}
+
+func (f requestInterceptorFunc) InterceptRequestAfterAuth(ctx context.Context, req pluginapi.RequestInterceptRequest) (pluginapi.RequestInterceptResponse, error) {
 	if f == nil {
 		return pluginapi.RequestInterceptResponse{}, fmt.Errorf("missing request interceptor callback")
 	}
@@ -243,6 +286,15 @@ type schedulerFunc func(context.Context, pluginapi.SchedulerPickRequest) (plugin
 func (f schedulerFunc) Pick(ctx context.Context, req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, error) {
 	if f == nil {
 		return pluginapi.SchedulerPickResponse{}, fmt.Errorf("missing scheduler callback")
+	}
+	return f(ctx, req)
+}
+
+type modelRouterFunc func(context.Context, pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, error)
+
+func (f modelRouterFunc) RouteModel(ctx context.Context, req pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, error) {
+	if f == nil {
+		return pluginapi.ModelRouteResponse{}, fmt.Errorf("missing model router callback")
 	}
 	return f(ctx, req)
 }
