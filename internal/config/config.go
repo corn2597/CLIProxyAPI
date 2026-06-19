@@ -117,7 +117,7 @@ type Config struct {
 	// Codex configures provider-wide Codex request behavior.
 	Codex CodexConfig `yaml:"codex" json:"codex"`
 
-	// RiskControl configures pre-upstream LLM-based audit checks.
+	// RiskControl configures pre-upstream moderation-based audit checks.
 	RiskControl RiskControlConfig `yaml:"risk-control" json:"risk-control"`
 
 	// CodexHeaderDefaults configures fallback headers for Codex OAuth model requests.
@@ -267,7 +267,7 @@ type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
 }
 
-// RiskControlConfig configures LLM-based request auditing before provider execution.
+// RiskControlConfig configures OpenAI Moderation-based request auditing before provider execution.
 type RiskControlConfig struct {
 	// Enabled toggles risk-control checks. When false, the feature is inert.
 	Enabled bool `yaml:"enabled" json:"enabled"`
@@ -277,9 +277,10 @@ type RiskControlConfig struct {
 	Debug bool `yaml:"debug" json:"debug"`
 	// BaseURL is an OpenAI-compatible API base URL, usually ending in /v1.
 	BaseURL string `yaml:"base-url" json:"base-url"`
-	// Endpoint selects the OpenAI-compatible endpoint. Default: "responses".
+	// Endpoint selects the OpenAI-compatible endpoint. Default: "moderations".
+	// Legacy responses/chat-completions values normalize to moderations.
 	Endpoint string `yaml:"endpoint" json:"endpoint"`
-	// Model is the audit model sent to the configured API endpoint.
+	// Model is the moderation model sent to the configured API endpoint.
 	Model string `yaml:"model" json:"model"`
 	// APIKey is the single audit API key. Prefer APIKeys for rotation.
 	APIKey string `yaml:"api-key" json:"-"`
@@ -289,7 +290,7 @@ type RiskControlConfig struct {
 	TimeoutMS int `yaml:"timeout-ms" json:"timeout-ms"`
 	// FailPolicy controls audit backend failures: "open" allows, "closed" blocks.
 	FailPolicy string `yaml:"fail-policy" json:"fail-policy"`
-	// SessionAuditInterval controls per-session audit cadence. Default: 5m.
+	// SessionAuditInterval is retained for config compatibility. Runtime moderation still audits every request. Default: 5m.
 	SessionAuditInterval string `yaml:"session-audit-interval" json:"session-audit-interval"`
 	// SessionTTL controls in-memory session state retention. Default: 24h.
 	SessionTTL string `yaml:"session-ttl" json:"session-ttl"`
@@ -301,9 +302,9 @@ type RiskControlConfig struct {
 	AsyncWorkers int `yaml:"async-workers" json:"async-workers"`
 	// AsyncQueueSize controls the async audit queue size for async_block mode. Default: 1024.
 	AsyncQueueSize int `yaml:"async-queue-size" json:"async-queue-size"`
-	// AsyncRetryDelay controls retry backoff after async audit failures. Default: 30s.
+	// AsyncRetryDelay is retained for async failure bookkeeping compatibility. Default: 30s.
 	AsyncRetryDelay string `yaml:"async-retry-delay" json:"async-retry-delay"`
-	// BlockThreshold is the minimum structured confidence required to enforce a block. Values below 0.97 are raised to 0.97.
+	// BlockThreshold is retained for compatibility with legacy audit configs and logs. Values below 0.97 are raised to 0.97.
 	BlockThreshold float64 `yaml:"block-threshold" json:"block-threshold"`
 	// MaxInputRunes is deprecated and ignored by risk control v2. Full user input is forwarded to audit.
 	MaxInputRunes int `yaml:"max-input-runes" json:"max-input-runes"`
@@ -313,7 +314,7 @@ type RiskControlConfig struct {
 	BlockStatus int `yaml:"block-status" json:"block-status"`
 	// BlockMessage is the user-visible message for pre_block decisions.
 	BlockMessage string `yaml:"block-message" json:"block-message"`
-	// Prompt is deprecated and ignored. Risk control uses an internal OpenAI policy profile.
+	// Prompt is deprecated and ignored. Risk control uses moderation category mapping internally.
 	Prompt string `yaml:"prompt" json:"prompt"`
 }
 

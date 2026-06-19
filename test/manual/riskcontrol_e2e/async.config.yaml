@@ -1,0 +1,23 @@
+host: "127.0.0.1"
+port: 18318
+auth-dir: "test/manual/riskcontrol_e2e/auths"
+api-keys:
+  - "test-client-key"
+debug: true
+logging-to-file: true
+remote-management:
+  allow-remote: false
+  secret-key: "$2a$10$Nuw1V8squgvn6t0hiYpnr.PA5kVfsxPnwuvPQATnrTLd9pI0pwn6u"
+risk-control:
+  enabled: true
+  mode: "async_block"
+  base-url: "http://127.0.0.1:19090/v1"
+  endpoint: "moderations"
+  model: "omni-moderation-latest"
+  api-key: "sk-test"
+  timeout-ms: 3000
+  fail-policy: "closed"
+  blocked-session-ttl: "24h"
+  allow-session-ttl: "1h"
+  async-workers: 1
+  async-queue-size: 16

@@ -182,7 +182,7 @@ func processAsyncCodexAuditTask(task asyncCodexAuditTask) {
 		"decision_source": DecisionSourceFreshAudit,
 	}).Debug("risk control: completed async codex audit")
 
-	if decision.ObserveOnly {
+	if shouldRecordObserveEvent(task.settings, decision) {
 		recordCodexObserveEvent(finishedAt, task.settings, task.sessionID, task.req, task.opts, task.input, decision, DecisionSourceFreshAudit)
 	}
 	if decision.Blocked && shouldRecordBlockedEvent(task.settings, decision) {

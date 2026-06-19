@@ -391,43 +391,53 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			forceTranscriptReplayNextRequest = false
 		}
 
-		modelName := gjson.GetBytes(requestJSON, "model").String()
-		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
-		cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
-		if pinnedAuthID != "" {
-			cliCtx = handlers.WithPinnedAuthID(cliCtx, pinnedAuthID)
-		} else {
-			cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
-				authID = strings.TrimSpace(authID)
-				if authID == "" || h == nil || h.AuthManager == nil {
-					return
-				}
-				selectedAuth, ok := sessionAuthByID(authID)
-				if !ok || selectedAuth == nil {
-					return
-				}
-				if websocketUpstreamSupportsIncrementalInput(selectedAuth.Attributes, selectedAuth.Metadata) {
-					pinnedAuthID = authID
-				}
-			})
-		}
-		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
+		for {
+			modelName := gjson.GetBytes(requestJSON, "model").String()
+			cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+			cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
+			cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
+			if pinnedAuthID != "" {
+				cliCtx = handlers.WithPinnedAuthID(cliCtx, pinnedAuthID)
+			} else {
+				cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
+					authID = strings.TrimSpace(authID)
+					if authID == "" || h == nil || h.AuthManager == nil {
+						return
+					}
+					selectedAuth, ok := sessionAuthByID(authID)
+					if !ok || selectedAuth == nil {
+						return
+					}
+					if websocketUpstreamSupportsIncrementalInput(selectedAuth.Attributes, selectedAuth.Metadata) {
+						pinnedAuthID = authID
+					}
+				})
+			}
+			dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
 
-		completedOutput, forwardErrMsg, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, wsTimelineLog, passthroughSessionID)
-		if errForward != nil {
-			wsTerminateErr = errForward
-			log.Warnf("responses websocket: forward failed id=%s error=%v", passthroughSessionID, errForward)
-			return
+			completedOutput, forwardErrMsg, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, wsTimelineLog, passthroughSessionID)
+			if errForward != nil {
+				wsTerminateErr = errForward
+				log.Warnf("responses websocket: forward failed id=%s error=%v", passthroughSessionID, errForward)
+				return
+			}
+			if shouldFallbackResponsesWebsocketBootstrapToHTTP(forwardErrMsg) {
+				pinnedAuthID = ""
+				requestJSON = stripResponsesWebsocketGenerateFlag(requestJSON)
+				updatedLastRequest = bytes.Clone(requestJSON)
+				lastRequest = updatedLastRequest
+				continue
+			}
+			if shouldReleaseResponsesWebsocketPinnedAuth(forwardErrMsg) {
+				pinnedAuthID = ""
+				forceTranscriptReplayNextRequest = true
+				lastRequest = previousLastRequest
+				lastResponseOutput = previousLastResponseOutput
+				break
+			}
+			lastResponseOutput = completedOutput
+			break
 		}
-		if shouldReleaseResponsesWebsocketPinnedAuth(forwardErrMsg) {
-			pinnedAuthID = ""
-			forceTranscriptReplayNextRequest = true
-			lastRequest = previousLastRequest
-			lastResponseOutput = previousLastResponseOutput
-			continue
-		}
-		lastResponseOutput = completedOutput
 	}
 }
 
@@ -1157,6 +1167,10 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				continue
 			}
 			if errMsg != nil {
+				if shouldFallbackResponsesWebsocketBootstrapToHTTP(errMsg) {
+					cancel(errMsg.Error)
+					return completedOutput, errMsg, nil
+				}
 				h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 				markAPIResponseTimestamp(c)
 				errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
@@ -1262,9 +1276,39 @@ func shouldReleaseResponsesWebsocketPinnedAuth(errMsg *interfaces.ErrorMessage) 
 	switch status {
 	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests:
 		return true
+	case http.StatusServiceUnavailable:
+		return shouldFallbackResponsesWebsocketBootstrapToHTTP(errMsg)
 	default:
 		return false
 	}
+}
+
+func shouldFallbackResponsesWebsocketBootstrapToHTTP(errMsg *interfaces.ErrorMessage) bool {
+	if errMsg == nil || errMsg.Error == nil {
+		return false
+	}
+	status := errMsg.StatusCode
+	if status <= 0 {
+		if se, ok := errMsg.Error.(interface{ StatusCode() int }); ok && se != nil {
+			status = se.StatusCode()
+		}
+	}
+	if status != http.StatusServiceUnavailable {
+		return false
+	}
+	raw := strings.TrimSpace(errMsg.Error.Error())
+	if raw == "" || !gjson.Valid(raw) {
+		return false
+	}
+	return strings.TrimSpace(gjson.Get(raw, "error.code").String()) == "ws_failed"
+}
+
+func stripResponsesWebsocketGenerateFlag(rawJSON []byte) []byte {
+	updated, err := sjson.DeleteBytes(rawJSON, "generate")
+	if err != nil {
+		return rawJSON
+	}
+	return updated
 }
 
 func responseCompletedOutputFromPayload(payload []byte) []byte {

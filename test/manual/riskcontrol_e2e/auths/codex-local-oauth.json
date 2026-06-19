@@ -1,0 +1,1 @@
+{"access_token":"mock-codex-access-token","base_url":"http://127.0.0.1:19091","disabled":false,"email":"local-riskcontrol@example.com","note":"Local Codex OAuth-style auth for risk-control e2e validation","refresh_token":"mock-codex-refresh-token","type":"codex","websockets":false}

@@ -155,7 +155,7 @@ codex:
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false
 
-# LLM-based risk-control audit for Codex requests.
+# OpenAI Moderation-based risk-control audit for Codex requests.
 # The audit client uses this OpenAI-compatible API config directly and does not
 # reuse Codex OAuth/file-backed auth pools. Internal audit requests carry a
 # bypass header so pointing base-url back to this proxy will not recursively
@@ -165,25 +165,25 @@ codex:
 #   mode: "observe"                 # off, observe, pre_block, async_block
 #   debug: false                    # when true, keep audit/logging but skip real bans
 #   base-url: "https://api.example.com/v1"
-#   endpoint: "responses"           # responses (recommended), chat-completions, or moderations
-#   model: "audit-model"
+#   endpoint: "moderations"         # default; legacy responses/chat-completions values normalize here
+#   model: "omni-moderation-latest"
 #   api-key: "sk-..."
 #   # api-keys: ["sk-1", "sk-2"]    # optional independent audit key rotation
-#   session-audit-interval: "5m"
+#   session-audit-interval: "5m"    # legacy compatibility field; runtime still audits every request
 #   session-ttl: "24h"
 #   blocked-session-ttl: "168h"     # blacklist a blocked session_id for 7 days
 #   allow-session-ttl: "1h"         # manual allow-session override lifetime
 #   async-workers: 4                # async_block worker count
 #   async-queue-size: 1024          # async_block queue size
-#   async-retry-delay: "30s"        # retry backoff after async audit failures
-#   block-threshold: 0.97             # values below 0.97 are raised to 0.97
+#   async-retry-delay: "30s"        # legacy compatibility field for async failure bookkeeping
+#   block-threshold: 0.97           # legacy compatibility field retained in logs/config normalization
 #   timeout-ms: 3000
 #   fail-policy: "open"             # open or closed
 #   block-status: 403
 #   block-message: "risk control audit blocked this request"
 #   # max-input-runes / max-input-images are deprecated in risk control v2:
-#   # full user-role input is forwarded to the audit model without local clipping.
-#   # prompt is deprecated and ignored; the server uses an internal OpenAI policy profile
+#   # full user-role input is forwarded to the moderation API without local clipping.
+#   # prompt is deprecated and ignored; the server uses moderation category mapping internally
 #   # prompt: "..."
 
 # When true, enable authentication for the WebSocket API (/v1/ws).

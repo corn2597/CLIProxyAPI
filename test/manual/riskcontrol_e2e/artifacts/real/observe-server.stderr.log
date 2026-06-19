@@ -1,0 +1,10 @@
+=c:\Users\zhangyuming\CLIProxyAPI\test\manual\riskcontrol_e2e\runtime\real-observe : 无法将“=c:\Users\zhangyuming\CLIP
+roxyAPI\test\manual\riskcontrol_e2e\runtime\real-observe”项识别为 cmdlet、函数、脚本文件或可运行程序的名称。请检查名称
+的拼写，如果包括路径，请确保路径正确，然后再试一次。
+所在位置 行:1 字符: 1
++ ='c:\Users\zhangyuming\CLIProxyAPI\test\manual\riskcontrol_e2e\runtim ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (=c:\Users\zhang...me\real-observe:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 
+exit status 0xffffffff

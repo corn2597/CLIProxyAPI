@@ -191,17 +191,25 @@ func (s settings) auditsAsynchronously() bool {
 func normalizeEndpoint(raw string) string {
 	value := strings.ToLower(strings.TrimSpace(raw))
 	switch value {
-	case "", "responses", "response", "openai-responses", "/responses":
-		return EndpointResponses
-	case "chat", "chat_completion", "chat-completions", "chat/completions", "/chat/completions":
-		return EndpointChatCompletions
-	case "moderation", "moderations", "/moderations":
+	case "",
+		"moderation",
+		"moderations",
+		"/moderations",
+		"responses",
+		"response",
+		"openai-responses",
+		"/responses",
+		"chat",
+		"chat_completion",
+		"chat-completions",
+		"chat/completions",
+		"/chat/completions":
 		return EndpointModerations
 	default:
 		if strings.HasPrefix(strings.TrimSpace(raw), "/") {
 			return strings.TrimSpace(raw)
 		}
-		return EndpointResponses
+		return EndpointModerations
 	}
 }
 

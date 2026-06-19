@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -118,7 +119,7 @@ func EnsureCodexAllowed(ctx context.Context, cfg *config.Config, req executor.Re
 			"decision_source": decisionSource,
 		}).Debug("risk control: audited codex session")
 	}
-	if decisionSource == DecisionSourceFreshAudit && decision.ObserveOnly {
+	if decisionSource == DecisionSourceFreshAudit && shouldRecordObserveEvent(settings, decision) {
 		recordCodexObserveEvent(now, settings, sessionID, req, opts, input, decision, decisionSource)
 	}
 	if decisionSource == DecisionSourceFreshAudit && decision.Blocked && shouldRecordBlockedEvent(settings, decision) {
@@ -140,6 +141,16 @@ func shouldRecordBlockedEvent(settings settings, decision Decision) bool {
 	default:
 		return false
 	}
+}
+
+func shouldRecordObserveEvent(settings settings, decision Decision) bool {
+	if decision.Error != "" {
+		return false
+	}
+	if decision.ObserveOnly {
+		return true
+	}
+	return settings.mode == ModeObserve && decision.Blocked
 }
 
 func blockedDecisionError(settings settings, decision Decision) error {
@@ -315,7 +326,15 @@ func performAudit(ctx context.Context, cfg *config.Config, settings settings, se
 	if errAudit != nil {
 		return decisionFromAuditError(settings, errAudit.Error())
 	}
-	return applyAuditInputGuard(input, decision)
+	rawResponse := decision.RawResponse
+	if isModerationRawResponse(rawResponse) {
+		decision.RawResponse = ""
+	}
+	decision = applyAuditInputGuard(input, decision)
+	if decision.RawResponse == "" {
+		decision.RawResponse = rawResponse
+	}
+	return decision
 }
 
 func decisionFromAuditError(settings settings, message string) Decision {
@@ -407,11 +426,13 @@ func normalizeBlockedReason(settings settings, message string) string {
 }
 
 func auditRequestBody(settings settings, sessionID string, model string, input AuditInput) ([]byte, error) {
+	_ = sessionID
+	_ = model
 	switch settings.endpoint {
 	case EndpointModerations:
 		return json.Marshal(map[string]any{
 			"model": settings.model,
-			"input": auditInputText(sessionID, model, input),
+			"input": moderationInputText(input),
 		})
 	case EndpointResponses:
 		return json.Marshal(map[string]any{
@@ -451,6 +472,28 @@ func auditRequestBody(settings settings, sessionID string, model string, input A
 			},
 		})
 	}
+}
+
+func moderationInputText(input AuditInput) string {
+	var builder strings.Builder
+
+	text := strings.TrimSpace(input.Text)
+	if strings.TrimSpace(input.FocusStatus) == auditFocusExtracted && strings.TrimSpace(input.FocusText) != "" {
+		text = strings.TrimSpace(input.FocusText)
+	}
+	builder.WriteString(text)
+
+	if len(input.Images) > 0 {
+		if builder.Len() > 0 {
+			builder.WriteString("\n\n")
+		}
+		builder.WriteString("[image_references]\n")
+		for i, image := range input.Images {
+			builder.WriteString(fmt.Sprintf("%d. %s\n", i+1, image))
+		}
+	}
+
+	return strings.TrimSpace(builder.String())
 }
 
 func auditInputText(sessionID string, model string, input AuditInput) string {
@@ -622,10 +665,13 @@ func auditURL(settings settings) string {
 		return ""
 	}
 	lowerBase := strings.ToLower(base)
-	if strings.HasSuffix(lowerBase, "/chat/completions") || strings.HasSuffix(lowerBase, "/moderations") || strings.HasSuffix(lowerBase, "/responses") {
-		return base
+	for _, suffix := range []string{"/chat/completions", "/moderations", "/responses"} {
+		if strings.HasSuffix(lowerBase, suffix) {
+			base = base[:len(base)-len(suffix)]
+			break
+		}
 	}
-	path := "/responses"
+	path := "/moderations"
 	switch settings.endpoint {
 	case EndpointModerations:
 		path = "/moderations"
@@ -666,107 +712,174 @@ func newAuditHTTPClient(_ context.Context, cfg *config.Config, timeout time.Dura
 	return client
 }
 
+func isModerationRawResponse(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	return raw != "" && gjson.Valid(raw) && gjson.Get(raw, "results.0.flagged").Exists()
+}
+
 func parseAuditDecision(settings settings, raw []byte) (Decision, error) {
-	if flagged := gjson.GetBytes(raw, "results.0.flagged"); flagged.Exists() {
-		policyCode := moderationPolicyCodeFromResponse(raw)
-		if policyCode == "" {
-			return Decision{Blocked: false}, nil
-		}
-		return Decision{Blocked: true, Reason: policyCode, PolicyCode: policyCode}, nil
+	_ = settings
+
+	result := gjson.GetBytes(raw, "results.0")
+	if !result.Exists() {
+		return Decision{}, fmt.Errorf("risk control: moderation response missing results[0]")
 	}
-	content := strings.TrimSpace(extractResponsesOutputText(raw))
-	if content == "" {
-		content = strings.TrimSpace(gjson.GetBytes(raw, "choices.0.message.content").String())
+	flagged := result.Get("flagged")
+	if !flagged.Exists() {
+		return Decision{}, fmt.Errorf("risk control: moderation response missing flagged")
 	}
-	if content == "" {
-		if gjson.GetBytes(raw, "decision").Exists() || gjson.GetBytes(raw, "action").Exists() || gjson.GetBytes(raw, "policy_code").Exists() || gjson.GetBytes(raw, "policyCode").Exists() {
-			content = string(raw)
-		} else {
-			return Decision{}, fmt.Errorf("risk control: audit response missing decision content")
-		}
-	}
-	jsonContent := extractJSONObject(content)
-	if jsonContent == "" {
-		return Decision{}, fmt.Errorf("risk control: audit decision is not JSON")
-	}
-	action := normalizeAuditAction(gjson.Get(jsonContent, "decision").String())
-	if action == "" {
-		action = normalizeAuditAction(gjson.Get(jsonContent, "action").String())
-	}
-	flagged := gjson.Get(jsonContent, "flagged")
-	switch action {
-	case "allow":
-		if flagged.Exists() && flagged.Bool() {
-			return Decision{}, fmt.Errorf("risk control: inconsistent allow decision with flagged=true")
-		}
-		return Decision{Blocked: false}, nil
-	case "block":
-		if flagged.Exists() && !flagged.Bool() {
-			return Decision{}, fmt.Errorf("risk control: inconsistent block decision with flagged=false")
-		}
-		policyCode := extractAuditPolicyCode(jsonContent)
-		if !isOpenAIHardStopPolicyCode(policyCode) {
-			return Decision{}, fmt.Errorf("risk control: unsupported policy_code %q", policyCode)
-		}
-		subcategoryCode := extractAuditSubcategoryCode(jsonContent)
-		if !isOpenAIHardStopSubcategoryCode(subcategoryCode) {
-			return Decision{}, fmt.Errorf("risk control: unsupported subcategory_code %q", subcategoryCode)
-		}
-		confidence, err := extractAuditConfidence(jsonContent)
-		if err != nil {
-			return Decision{}, err
-		}
-		reason := strings.TrimSpace(gjson.Get(jsonContent, "reason").String())
-		if reason == "" {
-			reason = normalizePolicyCode(policyCode)
-		}
-		decision := Decision{
-			Blocked:           confidence >= settings.blockThreshold,
-			Reason:            reason,
-			PolicyCode:        policyCode,
-			SubcategoryCode:   subcategoryCode,
-			Confidence:        confidence,
-			AuthorizedContext: normalizeAuthorizedContext(gjson.Get(jsonContent, "authorized_context").String()),
-			MaliciousIntent:   gjson.Get(jsonContent, "malicious_intent").Bool(),
-			Evidence:          extractAuditEvidence(jsonContent),
-			RawResponse:       strings.TrimSpace(content),
-		}
-		return applyHardStopEnforcement(decision), nil
-	case "observe":
-		if flagged.Exists() && flagged.Bool() {
-			return Decision{}, fmt.Errorf("risk control: inconsistent observe decision with flagged=true")
-		}
-		policyCode := extractAuditPolicyCode(jsonContent)
-		subcategoryCode := extractAuditSubcategoryCode(jsonContent)
-		if policyCode == "" || policyCode == "none" || subcategoryCode == "" || subcategoryCode == "none" {
-			return Decision{Blocked: false}, nil
-		}
-		if !isOpenAIHardStopPolicyCode(policyCode) {
-			return Decision{}, fmt.Errorf("risk control: unsupported observe policy_code %q", policyCode)
-		}
-		if !isOpenAIHardStopSubcategoryCode(subcategoryCode) {
-			return Decision{}, fmt.Errorf("risk control: unsupported observe subcategory_code %q", subcategoryCode)
-		}
-		confidence, _ := extractAuditConfidence(jsonContent)
-		reason := strings.TrimSpace(gjson.Get(jsonContent, "reason").String())
-		if reason == "" {
-			reason = "observe only"
+
+	matches := moderationMatches(result)
+	rawResponse := strings.TrimSpace(string(raw))
+	if len(matches) == 0 {
+		if flagged.Bool() {
+			return Decision{
+				ObserveOnly:       true,
+				Reason:            "flagged by moderation",
+				PolicyCode:        "moderation_flagged",
+				SubcategoryCode:   "flagged",
+				RawResponse:       rawResponse,
+				AuthorizedContext: "unknown",
+			}, nil
 		}
 		return Decision{
 			Blocked:           false,
-			ObserveOnly:       true,
-			Reason:            reason,
-			PolicyCode:        policyCode,
-			SubcategoryCode:   subcategoryCode,
-			Confidence:        confidence,
-			AuthorizedContext: normalizeAuthorizedContext(gjson.Get(jsonContent, "authorized_context").String()),
-			MaliciousIntent:   gjson.Get(jsonContent, "malicious_intent").Bool(),
-			Evidence:          extractAuditEvidence(jsonContent),
-			RawResponse:       strings.TrimSpace(content),
+			Reason:            "",
+			PolicyCode:        "none",
+			SubcategoryCode:   "none",
+			AuthorizedContext: "unknown",
+			RawResponse:       rawResponse,
 		}, nil
-	default:
-		return Decision{}, fmt.Errorf("risk control: audit response missing valid action")
 	}
+
+	primary := matches[0]
+	hardBlocked := false
+	confidence := 0.0
+	for _, match := range matches {
+		if match.Score > confidence {
+			confidence = match.Score
+		}
+		if match.HardBlock {
+			hardBlocked = true
+		}
+	}
+	if confidence <= 0 {
+		confidence = primary.Score
+	}
+	if confidence <= 0 {
+		confidence = 1
+	}
+
+	decision := Decision{
+		Blocked:           hardBlocked,
+		ObserveOnly:       !hardBlocked,
+		Reason:            primary.Reason,
+		PolicyCode:        primary.PolicyCode,
+		SubcategoryCode:   primary.SubcategoryCode,
+		Confidence:        confidence,
+		AuthorizedContext: "unknown",
+		MaliciousIntent:   primary.MaliciousIntent,
+		Evidence:          cloneStrings(primary.Evidence),
+		RawResponse:       rawResponse,
+	}
+	if decision.Reason == "" {
+		if decision.Blocked {
+			decision.Reason = "blocked by moderation"
+		} else {
+			decision.Reason = "observe only"
+		}
+	}
+	return decision, nil
+}
+
+type moderationMatch struct {
+	Category        string
+	PolicyCode      string
+	SubcategoryCode string
+	Reason          string
+	Score           float64
+	HardBlock       bool
+	MaliciousIntent bool
+	Evidence        []string
+}
+
+func moderationMatches(result gjson.Result) []moderationMatch {
+	categories := result.Get("categories")
+	if !categories.IsObject() {
+		return nil
+	}
+
+	matches := make([]moderationMatch, 0, 4)
+	categories.ForEach(func(key, value gjson.Result) bool {
+		if !value.Bool() {
+			return true
+		}
+		category := strings.TrimSpace(key.String())
+		if category == "" {
+			return true
+		}
+		matches = append(matches, moderationMatchForCategory(result, category))
+		return true
+	})
+
+	sort.SliceStable(matches, func(i, j int) bool {
+		if matches[i].HardBlock != matches[j].HardBlock {
+			return matches[i].HardBlock
+		}
+		if matches[i].Score == matches[j].Score {
+			return matches[i].Category < matches[j].Category
+		}
+		return matches[i].Score > matches[j].Score
+	})
+
+	return matches
+}
+
+func moderationMatchForCategory(result gjson.Result, category string) moderationMatch {
+	score := result.Get("category_scores").Get(category).Float()
+	subcategory := normalizeModerationCategoryCode(category)
+
+	match := moderationMatch{
+		Category:        category,
+		PolicyCode:      "moderation_flagged",
+		SubcategoryCode: subcategory,
+		Reason:          "moderation flagged category: " + category,
+		Score:           score,
+		HardBlock:       false,
+		MaliciousIntent: false,
+		Evidence:        []string{category},
+	}
+
+	switch category {
+	case "sexual/minors":
+		match.PolicyCode = "child_sexual_abuse_or_grooming"
+		match.SubcategoryCode = "child_sexual_content"
+		match.Reason = "moderation blocked category: sexual/minors"
+		match.HardBlock = true
+		match.MaliciousIntent = true
+	case "self-harm/instructions":
+		match.PolicyCode = "self_harm_facilitation"
+		match.SubcategoryCode = "self_harm_instruction"
+		match.Reason = "moderation blocked category: self-harm/instructions"
+		match.HardBlock = true
+	case "illicit/violent":
+		match.PolicyCode = "terror_or_violent_harm"
+		match.SubcategoryCode = "illicit_violent"
+		match.Reason = "moderation blocked category: illicit/violent"
+		match.HardBlock = true
+		match.MaliciousIntent = true
+	}
+
+	return match
+}
+
+func normalizeModerationCategoryCode(raw string) string {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	value = strings.NewReplacer("-", "_", "/", "_", " ", "_").Replace(value)
+	for strings.Contains(value, "__") {
+		value = strings.ReplaceAll(value, "__", "_")
+	}
+	return strings.Trim(value, "_")
 }
 
 func applyHardStopEnforcement(decision Decision) Decision {

@@ -6,50 +6,36 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
-func TestNormalizeSettingsDefaultsBlockThresholdToHighPrecision(t *testing.T) {
+func TestNormalizeSettingsDefaultsToModerationsEndpoint(t *testing.T) {
 	t.Parallel()
 
 	settings := normalizeSettings(&config.Config{RiskControl: config.RiskControlConfig{
 		Enabled: true,
 		Mode:    ModePreBlock,
 		BaseURL: "http://audit.local/v1",
-		Model:   "audit-model",
+		Model:   "omni-moderation-latest",
 	}})
 
-	if settings.blockThreshold != 0.97 {
-		t.Fatalf("blockThreshold = %v, want 0.97", settings.blockThreshold)
+	if settings.endpoint != EndpointModerations {
+		t.Fatalf("endpoint = %q, want %q", settings.endpoint, EndpointModerations)
 	}
 }
 
-func TestNormalizeSettingsClampsLowBlockThresholdToHighPrecision(t *testing.T) {
+func TestNormalizeSettingsMapsLegacyEndpointsToModerations(t *testing.T) {
 	t.Parallel()
 
-	settings := normalizeSettings(&config.Config{RiskControl: config.RiskControlConfig{
-		Enabled:        true,
-		Mode:           ModePreBlock,
-		BaseURL:        "http://audit.local/v1",
-		Model:          "audit-model",
-		BlockThreshold: 0.96,
-	}})
+	for _, endpoint := range []string{"responses", "chat-completions", "/responses", "/chat/completions"} {
+		settings := normalizeSettings(&config.Config{RiskControl: config.RiskControlConfig{
+			Enabled:  true,
+			Mode:     ModePreBlock,
+			BaseURL:  "http://audit.local/v1",
+			Model:    "omni-moderation-latest",
+			Endpoint: endpoint,
+		}})
 
-	if settings.blockThreshold != 0.97 {
-		t.Fatalf("blockThreshold = %v, want 0.97", settings.blockThreshold)
-	}
-}
-
-func TestNormalizeSettingsKeepsHigherBlockThreshold(t *testing.T) {
-	t.Parallel()
-
-	settings := normalizeSettings(&config.Config{RiskControl: config.RiskControlConfig{
-		Enabled:        true,
-		Mode:           ModePreBlock,
-		BaseURL:        "http://audit.local/v1",
-		Model:          "audit-model",
-		BlockThreshold: 0.99,
-	}})
-
-	if settings.blockThreshold != 0.99 {
-		t.Fatalf("blockThreshold = %v, want 0.99", settings.blockThreshold)
+		if settings.endpoint != EndpointModerations {
+			t.Fatalf("endpoint %q normalized to %q, want %q", endpoint, settings.endpoint, EndpointModerations)
+		}
 	}
 }
 
@@ -60,7 +46,7 @@ func TestNormalizeSettingsMapsLegacyDebugModeToShadowPreBlock(t *testing.T) {
 		Enabled: true,
 		Mode:    "debug",
 		BaseURL: "http://audit.local/v1",
-		Model:   "audit-model",
+		Model:   "omni-moderation-latest",
 	}})
 
 	if settings.mode != ModePreBlock {
@@ -79,7 +65,7 @@ func TestNormalizeSettingsAcceptsAsyncBlockModeAndDebugFlag(t *testing.T) {
 		Mode:            ModeAsyncBlock,
 		Debug:           true,
 		BaseURL:         "http://audit.local/v1",
-		Model:           "audit-model",
+		Model:           "omni-moderation-latest",
 		AsyncWorkers:    2,
 		AsyncQueueSize:  8,
 		AsyncRetryDelay: "45s",

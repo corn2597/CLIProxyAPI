@@ -33,7 +33,7 @@ func TestRiskControlLabeledSampleReplay(t *testing.T) {
 		Enabled:        true,
 		Mode:           ModePreBlock,
 		BaseURL:        baseURL,
-		Endpoint:       EndpointResponses,
+		Endpoint:       EndpointModerations,
 		Model:          model,
 		APIKey:         apiKey,
 		TimeoutMS:      90000,

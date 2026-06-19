@@ -48,7 +48,7 @@ func (s *sessionState) expired(now time.Time, ttl time.Duration) bool {
 	return !s.lastSeenAt.IsZero() && now.Sub(s.lastSeenAt) > ttl
 }
 
-// SessionTracker keeps deterministic per-session audit cadence.
+// SessionTracker keeps active session-ban state and the last observed decision.
 type SessionTracker struct {
 	mu          sync.Mutex
 	sessions    map[string]*sessionState
@@ -126,6 +126,7 @@ func (t *SessionTracker) evaluateWithoutBlockedBans(sessionID string, now time.T
 }
 
 func (t *SessionTracker) evaluateWithBlockedBans(sessionID string, now time.Time, interval time.Duration, ttl time.Duration, blockedTTL time.Duration, useBlockedBans bool, audit func() Decision) (Decision, string) {
+	_ = interval
 	state := t.state(sessionID, now, ttl)
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -145,10 +146,6 @@ func (t *SessionTracker) evaluateWithBlockedBans(sessionID string, now time.Time
 		state.blockedUntil = time.Time{}
 	}
 
-	due := state.lastAuditAt.IsZero() || now.Sub(state.lastAuditAt) >= interval
-	if !due {
-		return state.lastDecision, DecisionSourceCache
-	}
 	decision := audit()
 	decision.Audited = true
 	state.lastAuditAt = now
@@ -170,6 +167,7 @@ func (t *SessionTracker) evaluateWithBlockedBans(sessionID string, now time.Time
 }
 
 func (t *SessionTracker) admitAsync(sessionID string, now time.Time, interval time.Duration, ttl time.Duration, useBlockedBans bool) (Decision, string, bool) {
+	_ = interval
 	state := t.state(sessionID, now, ttl)
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -189,16 +187,6 @@ func (t *SessionTracker) admitAsync(sessionID string, now time.Time, interval ti
 		state.blockedUntil = time.Time{}
 	}
 
-	if state.auditPending {
-		return Decision{}, "", false
-	}
-	if !state.retryAfter.IsZero() && now.Before(state.retryAfter) {
-		return Decision{}, "", false
-	}
-	due := state.lastAuditAt.IsZero() || now.Sub(state.lastAuditAt) >= interval
-	if !due {
-		return state.lastDecision, DecisionSourceCache, false
-	}
 	state.auditPending = true
 	state.pendingSince = now
 	return Decision{}, DecisionSourceFreshAudit, true

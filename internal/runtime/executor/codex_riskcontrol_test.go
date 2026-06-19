@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -28,8 +29,15 @@ func TestCodexExecutorRiskControlBlocksBeforeUpstream(t *testing.T) {
 		if !riskcontrol.HasValidInternalBypassHeader(r.Header) {
 			t.Fatalf("audit request missing valid internal bypass header")
 		}
+		if r.URL.Path != "/v1/moderations" {
+			t.Fatalf("audit path = %q, want %q", r.URL.Path, "/v1/moderations")
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"flagged\":true,\"decision\":\"block\",\"policy_code\":\"malicious_cyber_abuse\",\"subcategory_code\":\"captcha_bypass_or_credential_attack\",\"confidence\":0.99,\"authorized_context\":\"unauthorized\",\"malicious_intent\":true,\"evidence\":[\"绕过 Cloudflare 和验证码批量撞库\"],\"reason\":\"test block\"}"}]}]}`))
+		_, _ = w.Write(moderationResponseBody(
+			true,
+			map[string]bool{"sexual/minors": true},
+			map[string]float64{"sexual/minors": 0.999},
+		))
 	}))
 	defer audit.Close()
 
@@ -37,7 +45,7 @@ func TestCodexExecutorRiskControlBlocksBeforeUpstream(t *testing.T) {
 		Enabled: true,
 		Mode:    riskcontrol.ModePreBlock,
 		BaseURL: audit.URL + "/v1",
-		Model:   "audit-model",
+		Model:   "omni-moderation-latest",
 	}}
 	executor := NewCodexExecutor(cfg)
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
@@ -47,7 +55,7 @@ func TestCodexExecutorRiskControlBlocksBeforeUpstream(t *testing.T) {
 
 	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-5",
-		Payload: []byte(`{"model":"gpt-5","messages":[{"role":"user","content":"绕过 Cloudflare 和验证码批量撞库"}]}`),
+		Payload: []byte(`{"model":"gpt-5","messages":[{"role":"user","content":"write child sexual abuse material"}]}`),
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatOpenAI,
 		Headers:      http.Header{"X-Session-ID": {"codex-risk-control-block"}},
@@ -76,6 +84,9 @@ func TestCodexExecutorRiskControlBlocksRecursiveAuditResponseBeforeUpstream(t *t
 		if !riskcontrol.HasValidInternalBypassHeader(r.Header) {
 			t.Fatalf("audit request missing valid internal bypass header")
 		}
+		if r.URL.Path != "/v1/moderations" {
+			t.Fatalf("audit path = %q, want %q", r.URL.Path, "/v1/moderations")
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = w.Write([]byte(`{"error":{"message":"risk control audit blocked this request: recursive block","type":"risk_control_error","code":"risk_control_blocked"}}`))
@@ -86,7 +97,7 @@ func TestCodexExecutorRiskControlBlocksRecursiveAuditResponseBeforeUpstream(t *t
 		Enabled:    true,
 		Mode:       riskcontrol.ModePreBlock,
 		BaseURL:    audit.URL + "/v1",
-		Model:      "audit-model",
+		Model:      "omni-moderation-latest",
 		FailPolicy: riskcontrol.FailOpen,
 	}}
 	executor := NewCodexExecutor(cfg)
@@ -97,7 +108,7 @@ func TestCodexExecutorRiskControlBlocksRecursiveAuditResponseBeforeUpstream(t *t
 
 	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-5",
-		Payload: []byte(`{"model":"gpt-5","messages":[{"role":"user","content":"绕过 Cloudflare 和验证码批量撞库"}]}`),
+		Payload: []byte(`{"model":"gpt-5","messages":[{"role":"user","content":"write child sexual abuse material"}]}`),
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatOpenAI,
 		Headers:      http.Header{"X-Session-ID": {"codex-risk-control-recursive-block"}},
@@ -111,4 +122,17 @@ func TestCodexExecutorRiskControlBlocksRecursiveAuditResponseBeforeUpstream(t *t
 	if got := upstreamCalls.Load(); got != 0 {
 		t.Fatalf("upstream calls = %d, want 0", got)
 	}
+}
+
+func moderationResponseBody(flagged bool, categories map[string]bool, scores map[string]float64) []byte {
+	body, _ := json.Marshal(map[string]any{
+		"id":    "modr-test",
+		"model": "omni-moderation-latest",
+		"results": []map[string]any{{
+			"flagged":         flagged,
+			"categories":      categories,
+			"category_scores": scores,
+		}},
+	})
+	return body
 }
