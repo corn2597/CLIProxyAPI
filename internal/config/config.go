@@ -302,7 +302,7 @@ type RiskControlConfig struct {
 	TimeoutMS int `yaml:"timeout-ms" json:"timeout-ms"`
 	// FailPolicy controls audit backend failures: "open" allows, "closed" blocks.
 	FailPolicy string `yaml:"fail-policy" json:"fail-policy"`
-	// SessionAuditInterval is retained for config compatibility. Runtime moderation still audits every request. Default: 5m.
+	// SessionAuditInterval controls per-session audit sampling: the first request is always audited, then successful audits are reused until this interval elapses. Default: 5m.
 	SessionAuditInterval string `yaml:"session-audit-interval" json:"session-audit-interval"`
 	// SessionTTL controls in-memory session state retention. Default: 24h.
 	SessionTTL string `yaml:"session-ttl" json:"session-ttl"`
@@ -314,7 +314,7 @@ type RiskControlConfig struct {
 	AsyncWorkers int `yaml:"async-workers" json:"async-workers"`
 	// AsyncQueueSize controls the async audit queue size for async_block mode. Default: 1024.
 	AsyncQueueSize int `yaml:"async-queue-size" json:"async-queue-size"`
-	// AsyncRetryDelay is retained for async failure bookkeeping compatibility. Default: 30s.
+	// AsyncRetryDelay controls async audit retry backoff after audit backend failures. Default: 30s.
 	AsyncRetryDelay string `yaml:"async-retry-delay" json:"async-retry-delay"`
 	// BlockThreshold is retained for compatibility with legacy audit configs and logs. Values below 0.97 are raised to 0.97.
 	BlockThreshold float64 `yaml:"block-threshold" json:"block-threshold"`

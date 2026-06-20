@@ -192,13 +192,13 @@ codex:
 #   model: "omni-moderation-latest"
 #   api-key: "sk-..."
 #   # api-keys: ["sk-1", "sk-2"]    # optional independent audit key rotation
-#   session-audit-interval: "5m"    # legacy compatibility field; runtime still audits every request
+#   session-audit-interval: "5m"    # audit first request per session, then reuse successful result for 5 minutes
 #   session-ttl: "24h"
 #   blocked-session-ttl: "168h"     # blacklist a blocked session_id for 7 days
 #   allow-session-ttl: "1h"         # manual allow-session override lifetime
 #   async-workers: 4                # async_block worker count
 #   async-queue-size: 1024          # async_block queue size
-#   async-retry-delay: "30s"        # legacy compatibility field for async failure bookkeeping
+#   async-retry-delay: "30s"        # retry backoff after async audit backend failures
 #   block-threshold: 0.97           # legacy compatibility field retained in logs/config normalization
 #   timeout-ms: 3000
 #   fail-policy: "open"             # open or closed

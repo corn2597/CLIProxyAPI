@@ -36,6 +36,7 @@ GEMINI.md
 # Tooling metadata
 .vscode/*
 .worktrees/
+.playwright-cli/
 .codex/*
 .claude/*
 .gemini/*
@@ -49,6 +50,12 @@ GEMINI.md
 .bmad/*
 _bmad/*
 _bmad-output/*
+
+# Local manual risk-control validation outputs
+test/manual/riskcontrol_e2e/artifacts/session-interval-smoke/
+test/manual/riskcontrol_e2e/auths/logs/
+test/manual/riskcontrol_e2e/runtime/
+test/manual/riskcontrol_e2e/test/
 
 # macOS
 .DS_Store

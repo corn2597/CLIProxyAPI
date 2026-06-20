@@ -104,7 +104,7 @@ func newRiskControlConfig(serverURL string, mode string) *config.Config {
 	}
 }
 
-func TestEnsureCodexAllowedAuditsEveryRequestUntilBlockedBan(t *testing.T) {
+func TestEnsureCodexAllowedCachesSuccessfulAuditWithinSessionInterval(t *testing.T) {
 	installFreshRiskControlState(t)
 
 	var calls atomic.Int32
@@ -128,13 +128,13 @@ func TestEnsureCodexAllowedAuditsEveryRequestUntilBlockedBan(t *testing.T) {
 	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
 		t.Fatalf("second request returned error: %v", err)
 	}
-	if got := calls.Load(); got != 2 {
-		t.Fatalf("audit calls = %d, want 2", got)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("audit calls = %d, want 1", got)
 	}
 
 	page := defaultAuditLogStore.ListAuditLogs(AuditLogListOptions{Limit: 10})
-	if page.Returned != 2 {
-		t.Fatalf("audit log count = %d, want 2", page.Returned)
+	if page.Returned != 1 {
+		t.Fatalf("audit log count = %d, want 1", page.Returned)
 	}
 }
 
@@ -331,6 +331,46 @@ func TestEnsureCodexAllowedAsyncBlockBansSessionAfterBackgroundAudit(t *testing.
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("audit calls = %d, want 1", got)
+	}
+}
+
+func TestEnsureCodexAllowedAsyncBlockReusesRecentAuditWithinSessionInterval(t *testing.T) {
+	installFreshRiskControlState(t)
+	resetAsyncDispatcherForTest(t)
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(moderationResponseBody(false, map[string]bool{}, map[string]float64{}))
+	}))
+	defer server.Close()
+
+	cfg := newRiskControlConfig(server.URL, ModeAsyncBlock)
+	req := newOpenAIRequest("hello world")
+	opts := newOpenAIOptions("session-async-cache")
+
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
+		t.Fatalf("first async request should be admitted: %v", err)
+	}
+	if !defaultAsyncAuditDispatcher.WaitIdle(2 * time.Second) {
+		t.Fatal("timed out waiting for first async audit")
+	}
+
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
+		t.Fatalf("second async request should reuse cached audit: %v", err)
+	}
+	if !defaultAsyncAuditDispatcher.WaitIdle(2 * time.Second) {
+		t.Fatal("timed out waiting for async dispatcher to stay idle")
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("audit calls = %d, want 1", got)
+	}
+
+	logPage := defaultAuditLogStore.ListAuditLogs(AuditLogListOptions{Limit: 10})
+	if logPage.Returned != 1 {
+		t.Fatalf("audit log count = %d, want 1", logPage.Returned)
 	}
 }
 
