@@ -68,6 +68,8 @@ func EnsureCodexAllowed(ctx context.Context, cfg *config.Config, req executor.Re
 		log.WithField("provider", "codex").Debug("risk control: no user input extracted; skipping audit")
 		return nil
 	}
+	summaryInput := summarizeAuditInput(input)
+	meta := newAuditRecordMeta(req, opts)
 
 	sessionID := codexSessionID(ctx, req, opts, originalPayload, translatedPayload)
 	if sessionID == "" {
@@ -86,11 +88,17 @@ func EnsureCodexAllowed(ctx context.Context, cfg *config.Config, req executor.Re
 			return blockedDecisionError(settings, decision)
 		}
 		if scheduled {
-			task := newAsyncCodexAuditTask(cfg, settings, sessionID, req, opts, input)
-			if err := defaultAsyncAuditDispatcher.Enqueue(task); err != nil {
+			task, err := newAsyncCodexAuditTask(cfg, settings, sessionID, meta, input)
+			if err != nil {
+				log.WithError(err).WithField("session_id", sessionID).Warn("risk control: failed to stage async audit")
+				queueDecision := asyncAuditEnqueueFailureDecision(err)
+				recordCodexAuditLog(now, 0, settings, sessionID, meta, summaryInput, queueDecision)
+				defaultTracker.completeAsyncAudit(sessionID, now, settings.sessionTTL, settings.blockedSessionTTL, settings.asyncRetryDelay, settings.usesBlockedBans(), queueDecision)
+			} else if err := defaultAsyncAuditDispatcher.Enqueue(task); err != nil {
+				defaultAuditSpoolStore.Remove(task.inputRef)
 				log.WithError(err).WithField("session_id", sessionID).Warn("risk control: failed to enqueue async audit")
 				queueDecision := asyncAuditEnqueueFailureDecision(err)
-				recordCodexAuditLog(now, 0, settings, sessionID, req, opts, input, queueDecision)
+				recordCodexAuditLog(now, 0, settings, sessionID, meta, summaryInput, queueDecision)
 				defaultTracker.completeAsyncAudit(sessionID, now, settings.sessionTTL, settings.blockedSessionTTL, settings.asyncRetryDelay, settings.usesBlockedBans(), queueDecision)
 			}
 		}
@@ -99,7 +107,7 @@ func EnsureCodexAllowed(ctx context.Context, cfg *config.Config, req executor.Re
 	audit := func() Decision {
 		auditStartedAt := time.Now()
 		auditDecision := performAudit(ctx, cfg, settings, sessionID, req.Model, input)
-		recordCodexAuditLog(auditStartedAt, time.Since(auditStartedAt), settings, sessionID, req, opts, input, auditDecision)
+		recordCodexAuditLog(auditStartedAt, time.Since(auditStartedAt), settings, sessionID, meta, summaryInput, auditDecision)
 		return auditDecision
 	}
 	var decision Decision
@@ -120,10 +128,10 @@ func EnsureCodexAllowed(ctx context.Context, cfg *config.Config, req executor.Re
 		}).Debug("risk control: audited codex session")
 	}
 	if decisionSource == DecisionSourceFreshAudit && shouldRecordObserveEvent(settings, decision) {
-		recordCodexObserveEvent(now, settings, sessionID, req, opts, input, decision, decisionSource)
+		recordCodexObserveEvent(now, settings, sessionID, meta, summaryInput, decision, decisionSource)
 	}
 	if decisionSource == DecisionSourceFreshAudit && decision.Blocked && shouldRecordBlockedEvent(settings, decision) {
-		recordCodexBlockedEvent(now, settings, sessionID, req, opts, input, decision, decisionSource, riskControlBlockMessage(settings, decision))
+		recordCodexBlockedEvent(now, settings, sessionID, meta, summaryInput, decision, decisionSource, riskControlBlockMessage(settings, decision))
 	}
 	if settings.enforcesCurrentRequest() && decision.Blocked {
 		return blockedDecisionError(settings, decision)
@@ -170,51 +178,38 @@ func riskControlBlockMessage(settings settings, decision Decision) string {
 	return message
 }
 
-func recordCodexBlockedEvent(now time.Time, settings settings, sessionID string, req executor.Request, opts executor.Options, input AuditInput, decision Decision, decisionSource string, blockMessage string) {
-	event := codexRiskControlEvent(now, settings, sessionID, req, opts, input, decision, decisionSource)
+func recordCodexBlockedEvent(now time.Time, settings settings, sessionID string, meta auditRecordMeta, input AuditInput, decision Decision, decisionSource string, blockMessage string) {
+	event := codexRiskControlEvent(now, settings, sessionID, meta, input, decision, decisionSource)
 	event.BlockMessage = blockMessage
 	DefaultBlockedEventStore().RecordBlockedEvent(event)
 }
 
-func recordCodexObserveEvent(now time.Time, settings settings, sessionID string, req executor.Request, opts executor.Options, input AuditInput, decision Decision, decisionSource string) {
-	event := codexRiskControlEvent(now, settings, sessionID, req, opts, input, decision, decisionSource)
+func recordCodexObserveEvent(now time.Time, settings settings, sessionID string, meta auditRecordMeta, input AuditInput, decision Decision, decisionSource string) {
+	event := codexRiskControlEvent(now, settings, sessionID, meta, input, decision, decisionSource)
 	event.DecisionSource = DecisionSourceObserveOnly
 	event.BlockMessage = ""
 	DefaultObserveEventStore().RecordBlockedEvent(event)
 }
 
-func recordCodexAuditLog(auditedAt time.Time, duration time.Duration, settings settings, sessionID string, req executor.Request, opts executor.Options, input AuditInput, decision Decision) {
-	entry := codexAuditLogEntry(auditedAt, duration, settings, sessionID, req, opts, input, decision)
+func recordCodexAuditLog(auditedAt time.Time, duration time.Duration, settings settings, sessionID string, meta auditRecordMeta, input AuditInput, decision Decision) {
+	entry := codexAuditLogEntry(auditedAt, duration, settings, sessionID, meta, input, decision)
 	DefaultAuditLogStore().RecordAuditLog(entry)
 }
 
-func codexAuditLogEntry(auditedAt time.Time, duration time.Duration, settings settings, sessionID string, req executor.Request, opts executor.Options, input AuditInput, decision Decision) AuditLogEntry {
-	requestedModel := metadataString(opts.Metadata, executor.RequestedModelMetadataKey)
-	if requestedModel == "" {
-		requestedModel = metadataString(req.Metadata, executor.RequestedModelMetadataKey)
-	}
-	if requestedModel == "" {
-		requestedModel = req.Model
-	}
-
-	requestPath := metadataString(opts.Metadata, executor.RequestPathMetadataKey)
-	if requestPath == "" {
-		requestPath = metadataString(req.Metadata, executor.RequestPathMetadataKey)
-	}
-
+func codexAuditLogEntry(auditedAt time.Time, duration time.Duration, settings settings, sessionID string, meta auditRecordMeta, input AuditInput, decision Decision) AuditLogEntry {
 	return AuditLogEntry{
 		AuditedAt:         auditedAt,
 		DurationMS:        duration.Milliseconds(),
 		Provider:          "codex",
 		SessionID:         sessionID,
-		RequestedModel:    requestedModel,
-		UpstreamModel:     strings.TrimSpace(req.Model),
+		RequestedModel:    meta.RequestedModel,
+		UpstreamModel:     meta.UpstreamModel,
 		AuditModel:        settings.model,
 		AuditEndpoint:     settings.endpoint,
 		Mode:              settings.mode,
 		Threshold:         settings.blockThreshold,
-		SourceFormat:      strings.TrimSpace(opts.SourceFormat.String()),
-		RequestPath:       requestPath,
+		SourceFormat:      meta.SourceFormat,
+		RequestPath:       meta.RequestPath,
 		MessageCount:      input.MessageCount,
 		InputHash:         input.Hash,
 		UserTextPreview:   input.Text,
@@ -251,35 +246,22 @@ func auditLogDecision(decision Decision) string {
 	return "allow"
 }
 
-func codexRiskControlEvent(now time.Time, settings settings, sessionID string, req executor.Request, opts executor.Options, input AuditInput, decision Decision, decisionSource string) BlockEvent {
+func codexRiskControlEvent(now time.Time, settings settings, sessionID string, meta auditRecordMeta, input AuditInput, decision Decision, decisionSource string) BlockEvent {
 	if decisionSource == "" {
 		decisionSource = DecisionSourceFreshAudit
-	}
-
-	requestedModel := metadataString(opts.Metadata, executor.RequestedModelMetadataKey)
-	if requestedModel == "" {
-		requestedModel = metadataString(req.Metadata, executor.RequestedModelMetadataKey)
-	}
-	if requestedModel == "" {
-		requestedModel = req.Model
-	}
-
-	requestPath := metadataString(opts.Metadata, executor.RequestPathMetadataKey)
-	if requestPath == "" {
-		requestPath = metadataString(req.Metadata, executor.RequestPathMetadataKey)
 	}
 
 	return BlockEvent{
 		BlockedAt:         now,
 		Provider:          "codex",
 		SessionID:         sessionID,
-		RequestedModel:    requestedModel,
-		UpstreamModel:     strings.TrimSpace(req.Model),
+		RequestedModel:    meta.RequestedModel,
+		UpstreamModel:     meta.UpstreamModel,
 		AuditModel:        settings.model,
 		AuditEndpoint:     settings.endpoint,
 		Mode:              settings.mode,
-		SourceFormat:      strings.TrimSpace(opts.SourceFormat.String()),
-		RequestPath:       requestPath,
+		SourceFormat:      meta.SourceFormat,
+		RequestPath:       meta.RequestPath,
 		MessageCount:      input.MessageCount,
 		InputHash:         input.Hash,
 		UserTextPreview:   input.Text,

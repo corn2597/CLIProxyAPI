@@ -92,6 +92,9 @@ func TestBlockEventStorePersistsLatestEntriesOnly(t *testing.T) {
 			BlockedAt: base.Add(time.Duration(i) * time.Second),
 		})
 	}
+	if got := len(writer.events); got != 0 {
+		t.Fatalf("persistent writer kept %d events in memory, want 0", got)
+	}
 
 	reader := NewBlockEventStore(20)
 	if err := reader.ConfigurePersistence(filePath, 20); err != nil {
@@ -143,6 +146,29 @@ func TestBlockEventStoreLoadsUTF8BOMJSON(t *testing.T) {
 	}
 	if page.Items[0].SessionID != "session-2" {
 		t.Fatalf("SessionID = %q, want session-2", page.Items[0].SessionID)
+	}
+}
+
+func TestBlockEventStoreConfigurePersistenceFailsWhenPersistentStateUnreadable(t *testing.T) {
+	t.Parallel()
+
+	filePath := filepath.Join(t.TempDir(), "risk-control-blocks.jsonl")
+	original := []byte("{broken-json")
+	if err := os.WriteFile(filePath, original, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	store := NewBlockEventStore(20)
+	if err := store.ConfigurePersistence(filePath, 20); err == nil {
+		t.Fatal("ConfigurePersistence error = nil, want unreadable persistent state to fail fast")
+	}
+
+	raw, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(raw) != string(original) {
+		t.Fatalf("unexpected file mutation: %q", string(raw))
 	}
 }
 

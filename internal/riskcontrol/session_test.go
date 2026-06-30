@@ -2,6 +2,7 @@ package riskcontrol
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -223,5 +224,47 @@ func TestSessionTrackerAsyncFailureBacksOffBeforeRetry(t *testing.T) {
 	decision, source, scheduled = tracker.admitAsync("async-retry-session", now.Add(time.Second+retryDelay), interval, ttl, false)
 	if source != DecisionSourceFreshAudit || !scheduled || decision.Blocked {
 		t.Fatalf("retry admit decision=%+v source=%q scheduled=%t", decision, source, scheduled)
+	}
+}
+
+func TestSessionTrackerCompactsCachedDecisionPayload(t *testing.T) {
+	tracker := NewSessionTracker()
+	now := time.Unix(8000, 0)
+	interval := 5 * time.Minute
+	ttl := time.Hour
+
+	fresh, source := tracker.evaluate("compact-session", now, interval, ttl, 24*time.Hour, func() Decision {
+		return Decision{
+			Blocked:           true,
+			Reason:            strings.Repeat("r", auditLogReasonLimit+200),
+			PolicyCode:        "child_sexual_abuse_or_grooming",
+			SubcategoryCode:   "sexual_minors",
+			Evidence:          []string{"needle"},
+			RawResponse:       strings.Repeat("x", 4096),
+			AuthorizedContext: "allowed",
+		}
+	})
+	if source != DecisionSourceFreshAudit || !fresh.Blocked {
+		t.Fatalf("fresh decision=%+v source=%q", fresh, source)
+	}
+	if fresh.RawResponse == "" || len(fresh.Evidence) == 0 {
+		t.Fatalf("fresh decision unexpectedly compacted: %+v", fresh)
+	}
+
+	cached, source := tracker.evaluate("compact-session", now.Add(time.Minute), interval, ttl, 24*time.Hour, func() Decision {
+		t.Fatal("cached evaluate should not re-run audit")
+		return Decision{}
+	})
+	if source != DecisionSourceBlockedBan {
+		t.Fatalf("cached source = %q, want %q", source, DecisionSourceBlockedBan)
+	}
+	if cached.RawResponse != "" {
+		t.Fatalf("cached RawResponse = %q, want empty", cached.RawResponse)
+	}
+	if len(cached.Evidence) != 0 {
+		t.Fatalf("cached Evidence = %#v, want nil", cached.Evidence)
+	}
+	if len(cached.Reason) >= len(fresh.Reason) {
+		t.Fatalf("cached Reason length = %d, want compacted from fresh length %d", len(cached.Reason), len(fresh.Reason))
 	}
 }

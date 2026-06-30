@@ -1,7 +1,6 @@
 package riskcontrol
 
 import (
-	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -78,7 +77,6 @@ type SampleStore struct {
 	filePath    string
 	loaded      bool
 	nextID      uint64
-	records     []SampleRecord
 	labelsByKey map[string]map[string]SampleRecord
 }
 
@@ -111,9 +109,8 @@ func (s *SampleStore) ConfigurePersistence(filePath string) error {
 	s.filePath = filePath
 	s.loaded = false
 	s.nextID = 0
-	s.records = nil
 	s.labelsByKey = nil
-	return s.ensureLoadedLocked()
+	return nil
 }
 
 func (s *SampleStore) Append(record SampleRecord) (SampleRecord, error) {
@@ -131,7 +128,6 @@ func (s *SampleStore) Append(record SampleRecord) (SampleRecord, error) {
 	}
 	s.nextID++
 	record.ID = s.nextID
-	s.records = append(s.records, record)
 	s.indexSampleLocked(record)
 	if err := s.appendLocked(record); err != nil {
 		return SampleRecord{}, err
@@ -175,7 +171,6 @@ func (s *SampleStore) Upsert(record SampleRecord) (SampleRecord, bool, error) {
 	}
 	s.nextID++
 	record.ID = s.nextID
-	s.records = append(s.records, record)
 	s.indexSampleLocked(record)
 	if err := s.appendLocked(record); err != nil {
 		return SampleRecord{}, false, err
@@ -243,32 +238,17 @@ func (s *SampleStore) ensureLoadedLocked() error {
 	if s.loaded {
 		return nil
 	}
-	s.loaded = true
 	if strings.TrimSpace(s.filePath) == "" {
+		s.loaded = true
 		return nil
 	}
-	file, err := os.Open(s.filePath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	defer func() { _ = file.Close() }()
 
-	scanner := bufio.NewScanner(file)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 4<<20)
 	var maxID uint64
-	records := make([]SampleRecord, 0, 32)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
+	labelsByKey := make(map[string]map[string]SampleRecord)
+	err := scanJSONLFile(s.filePath, func(line []byte) error {
 		var record SampleRecord
-		if err := json.Unmarshal([]byte(line), &record); err != nil {
-			return err
+		if err := json.Unmarshal(line, &record); err != nil {
+			return fmt.Errorf("decode sample jsonl: %w", err)
 		}
 		record = sanitizeSample(record)
 		if record.SampleKey == "" {
@@ -277,14 +257,22 @@ func (s *SampleStore) ensureLoadedLocked() error {
 		if record.ID > maxID {
 			maxID = record.ID
 		}
-		records = append(records, record)
-	}
-	if err := scanner.Err(); err != nil {
+		indexSampleIntoMap(labelsByKey, record)
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.labelsByKey = nil
+			s.nextID = 0
+			s.loaded = true
+			return nil
+		}
 		return err
 	}
+
 	s.nextID = maxID
-	s.records = records
-	s.rebuildIndexLocked()
+	s.labelsByKey = labelsByKey
+	s.loaded = true
 	return nil
 }
 
@@ -338,16 +326,16 @@ func sanitizeSample(record SampleRecord) SampleRecord {
 	return record
 }
 
-func (s *SampleStore) rebuildIndexLocked() {
-	s.labelsByKey = make(map[string]map[string]SampleRecord)
-	for _, record := range s.records {
-		s.indexSampleLocked(record)
-	}
-}
-
 func (s *SampleStore) indexSampleLocked(record SampleRecord) {
 	if s.labelsByKey == nil {
 		s.labelsByKey = make(map[string]map[string]SampleRecord)
+	}
+	indexSampleIntoMap(s.labelsByKey, record)
+}
+
+func indexSampleIntoMap(labelsByKey map[string]map[string]SampleRecord, record SampleRecord) {
+	if labelsByKey == nil {
+		return
 	}
 	key := strings.TrimSpace(record.SampleKey)
 	if key == "" {
@@ -357,12 +345,12 @@ func (s *SampleStore) indexSampleLocked(record SampleRecord) {
 	if label == "" {
 		return
 	}
-	if s.labelsByKey[key] == nil {
-		s.labelsByKey[key] = make(map[string]SampleRecord)
+	if labelsByKey[key] == nil {
+		labelsByKey[key] = make(map[string]SampleRecord)
 	}
-	existing, ok := s.labelsByKey[key][label]
+	existing, ok := labelsByKey[key][label]
 	if !ok || record.ID >= existing.ID {
-		s.labelsByKey[key][label] = cloneSampleRecord(record)
+		labelsByKey[key][label] = cloneSampleRecord(record)
 	}
 }
 

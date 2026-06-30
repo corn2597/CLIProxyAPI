@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -49,6 +50,13 @@ func installFreshRiskControlState(t *testing.T) {
 	oldOverrideStore := defaultOverrideStore
 	defaultOverrideStore = NewOverrideStore()
 	t.Cleanup(func() { defaultOverrideStore = oldOverrideStore })
+
+	oldAuditSpoolStore := defaultAuditSpoolStore
+	defaultAuditSpoolStore = NewAuditSpoolStore()
+	if err := defaultAuditSpoolStore.Configure(t.TempDir()); err != nil {
+		t.Fatalf("Configure(defaultAuditSpoolStore): %v", err)
+	}
+	t.Cleanup(func() { defaultAuditSpoolStore = oldAuditSpoolStore })
 }
 
 func statusCodeFromTestError(t *testing.T, err error) int {
@@ -371,6 +379,63 @@ func TestEnsureCodexAllowedAsyncBlockReusesRecentAuditWithinSessionInterval(t *t
 	logPage := defaultAuditLogStore.ListAuditLogs(AuditLogListOptions{Limit: 10})
 	if logPage.Returned != 1 {
 		t.Fatalf("audit log count = %d, want 1", logPage.Returned)
+	}
+}
+
+func TestEnsureCodexAllowedAsyncBlockSpoolsFullInputAndKeepsPreviewBounded(t *testing.T) {
+	installFreshRiskControlState(t)
+	resetAsyncDispatcherForTest(t)
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		if !strings.Contains(string(body), "payload-needle-4999") {
+			t.Fatalf("audit body missing full user input tail: %s", string(body))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(moderationResponseBody(false, map[string]bool{}, map[string]float64{}))
+	}))
+	defer server.Close()
+
+	cfg := newRiskControlConfig(server.URL, ModeAsyncBlock)
+	req := newOpenAIRequest(strings.Join([]string{
+		strings.Repeat("prefix ", 1500),
+		"payload-needle-4999",
+	}, ""))
+	opts := newOpenAIOptions("session-async-spool-preview")
+
+	if err := EnsureCodexAllowed(context.Background(), cfg, req, opts, req.Payload, nil); err != nil {
+		t.Fatalf("async request should be admitted: %v", err)
+	}
+	if !defaultAsyncAuditDispatcher.WaitIdle(2 * time.Second) {
+		t.Fatal("timed out waiting for async audit")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("audit calls = %d, want 1", got)
+	}
+
+	logPage := defaultAuditLogStore.ListAuditLogs(AuditLogListOptions{Limit: 10})
+	if logPage.Returned != 1 {
+		t.Fatalf("audit log count = %d, want 1", logPage.Returned)
+	}
+	preview := logPage.Items[0].UserTextPreview
+	if len([]rune(preview)) <= auditSummaryTextLimit {
+		t.Fatalf("audit preview length = %d, want truncated preview beyond %d runes", len([]rune(preview)), auditSummaryTextLimit)
+	}
+	if !strings.HasSuffix(preview, "...[truncated]") {
+		t.Fatalf("audit preview suffix = %q, want truncated marker", preview[len(preview)-minInt(len(preview), 32):])
+	}
+
+	entries, err := os.ReadDir(defaultAuditSpoolStore.dir)
+	if err != nil {
+		t.Fatalf("ReadDir(spool): %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("spool files left behind: %v", entries)
 	}
 }
 

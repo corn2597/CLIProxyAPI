@@ -137,9 +137,10 @@ func (s *BlockEventStore) ConfigurePersistence(filePath string, maxEntries int) 
 	s.loaded = false
 	s.nextID = 0
 	s.events = nil
-
-	if err := s.ensureLoadedLocked(); err != nil {
-		log.WithError(err).Warn("risk control: failed to load blocked-event store")
+	if strings.TrimSpace(s.filePath) == "" {
+		return nil
+	}
+	if err := s.validatePersistentFileLocked(); err != nil {
 		return err
 	}
 	return nil
@@ -156,17 +157,26 @@ func (s *BlockEventStore) RecordBlockedEvent(event BlockEvent) BlockEvent {
 
 	if err := s.ensureLoadedLocked(); err != nil {
 		log.WithError(err).Warn("risk control: failed to prepare blocked-event store before record")
+		return cloneBlockedEvent(sanitizeBlockedEvent(event))
 	}
 
 	event = sanitizeBlockedEvent(event)
 	s.nextID++
 	event.ID = s.nextID
-	s.events = append(s.events, event)
-	if s.maxEntries > 0 && len(s.events) > s.maxEntries {
-		s.events = append([]BlockEvent(nil), s.events[len(s.events)-s.maxEntries:]...)
+	if strings.TrimSpace(s.filePath) == "" {
+		s.events = append(s.events, event)
+		if s.maxEntries > 0 && len(s.events) > s.maxEntries {
+			s.events = append([]BlockEvent(nil), s.events[len(s.events)-s.maxEntries:]...)
+		}
 	}
 	if err := s.appendLocked(event); err != nil {
 		log.WithError(err).Warn("risk control: failed to append blocked-event store")
+		return cloneBlockedEvent(event)
+	}
+	if strings.TrimSpace(s.filePath) != "" {
+		if err := s.enforceMaxEntriesLocked(); err != nil {
+			log.WithError(err).Warn("risk control: failed to trim blocked-event store")
+		}
 	}
 	return cloneBlockedEvent(event)
 }
@@ -188,11 +198,19 @@ func (s *BlockEventStore) ListBlockedEvents(opts BlockEventListOptions) BlockEve
 	needle := strings.ToLower(strings.TrimSpace(opts.SessionID))
 
 	s.mu.Lock()
-	if err := s.ensureLoadedLocked(); err != nil {
-		log.WithError(err).Warn("risk control: failed to load blocked-event store for listing")
+	var (
+		snapshot []BlockEvent
+		errLoad  error
+	)
+	if strings.TrimSpace(s.filePath) == "" {
+		snapshot = cloneBlockedEvents(s.events)
+	} else {
+		snapshot, errLoad = s.loadPersistentEventsLocked()
 	}
-	snapshot := cloneBlockedEvents(s.events)
 	s.mu.Unlock()
+	if errLoad != nil {
+		log.WithError(errLoad).Warn("risk control: failed to load blocked-event store for listing")
+	}
 
 	page.Items = make([]BlockEvent, 0, minInt(limit, len(snapshot)))
 	for i := len(snapshot) - 1; i >= 0; i-- {
@@ -226,13 +244,22 @@ func (s *BlockEventStore) GetBlockedEventByID(id uint64) (BlockEvent, bool) {
 		return BlockEvent{}, false
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.ensureLoadedLocked(); err != nil {
-		log.WithError(err).Warn("risk control: failed to load blocked-event store for lookup")
+	var (
+		snapshot []BlockEvent
+		errLoad  error
+	)
+	if strings.TrimSpace(s.filePath) == "" {
+		snapshot = cloneBlockedEvents(s.events)
+	} else {
+		snapshot, errLoad = s.loadPersistentEventsLocked()
 	}
-	for i := len(s.events) - 1; i >= 0; i-- {
-		if s.events[i].ID == id {
-			return cloneBlockedEvent(s.events[i]), true
+	s.mu.Unlock()
+	if errLoad != nil {
+		log.WithError(errLoad).Warn("risk control: failed to load blocked-event store for lookup")
+	}
+	for i := len(snapshot) - 1; i >= 0; i-- {
+		if snapshot[i].ID == id {
+			return cloneBlockedEvent(snapshot[i]), true
 		}
 	}
 	return BlockEvent{}, false
@@ -247,68 +274,138 @@ func (s *BlockEventStore) ensureLoadedLocked() error {
 	if s.loaded {
 		return nil
 	}
-	s.loaded = true
+	s.nextID = 0
 
 	if strings.TrimSpace(s.filePath) == "" {
+		s.loaded = true
 		return nil
 	}
 
-	data, err := os.ReadFile(s.filePath)
+	events, ok, err := s.tryLoadLegacyJSONLocked()
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
 		return err
 	}
-	content := strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
-	if content == "" {
+	if ok {
+		if s.maxEntries > 0 && len(events) > s.maxEntries {
+			events = append([]BlockEvent(nil), events[len(events)-s.maxEntries:]...)
+		}
+		if len(events) > 0 {
+			s.nextID = events[len(events)-1].ID
+		}
+		if err := s.rewriteAllLocked(events); err != nil {
+			return err
+		}
+		s.loaded = true
 		return nil
 	}
 
-	if strings.HasPrefix(content, "{") && !strings.Contains(content, "\n") {
-		if err := s.loadLegacyJSONLocked(content); err == nil {
-			return s.rewriteAllLocked()
+	line, err := readLastNonEmptyLine(s.filePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.loaded = true
+			return nil
 		}
+		return fmt.Errorf("read blocked-event tail: %w", err)
+	}
+	if len(line) == 0 {
+		s.loaded = true
+		return nil
+	}
+	var event BlockEvent
+	if err := json.Unmarshal(line, &event); err != nil {
+		return fmt.Errorf("decode blocked-event tail: %w", err)
+	}
+	event = sanitizeBlockedEvent(event)
+	s.nextID = event.ID
+	s.loaded = true
+	return nil
+}
+
+func (s *BlockEventStore) validatePersistentFileLocked() error {
+	s.nextID = 0
+	s.loaded = false
+
+	if strings.TrimSpace(s.filePath) == "" {
+		s.loaded = true
+		return nil
 	}
 
-	scanner := bufio.NewScanner(strings.NewReader(content))
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 4<<20)
-	events := make([]BlockEvent, 0, 32)
-	var maxID uint64
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+	events, ok, err := s.tryLoadLegacyJSONLocked()
+	if err != nil {
+		return err
+	}
+	if ok {
+		if s.maxEntries > 0 && len(events) > s.maxEntries {
+			events = append([]BlockEvent(nil), events[len(events)-s.maxEntries:]...)
 		}
+		if len(events) > 0 {
+			s.nextID = events[len(events)-1].ID
+		}
+		if err := s.rewriteAllLocked(events); err != nil {
+			return err
+		}
+		s.loaded = true
+		return nil
+	}
+
+	var (
+		maxID    uint64
+		total    int
+		retained []BlockEvent
+	)
+	err = scanJSONLFile(s.filePath, func(line []byte) error {
 		var event BlockEvent
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
+		if err := json.Unmarshal(line, &event); err != nil {
 			return fmt.Errorf("decode blocked-event jsonl: %w", err)
 		}
 		event = sanitizeBlockedEvent(event)
 		if event.ID > maxID {
 			maxID = event.ID
 		}
-		events = append(events, event)
-	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan blocked-event jsonl: %w", err)
+		total++
+		if s.maxEntries > 0 {
+			if len(retained) < s.maxEntries {
+				retained = append(retained, event)
+			} else {
+				copy(retained, retained[1:])
+				retained[len(retained)-1] = event
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.loaded = true
+			return nil
+		}
+		return err
 	}
 
-	s.events = events
 	s.nextID = maxID
-	if s.maxEntries > 0 && len(s.events) > s.maxEntries {
-		s.events = append([]BlockEvent(nil), s.events[len(s.events)-s.maxEntries:]...)
+	if s.maxEntries > 0 && total > s.maxEntries {
+		if err := s.rewriteAllLocked(retained); err != nil {
+			return err
+		}
 	}
+	s.loaded = true
 	return nil
 }
 
-func (s *BlockEventStore) loadLegacyJSONLocked(content string) error {
+func (s *BlockEventStore) tryLoadLegacyJSONLocked() ([]BlockEvent, bool, error) {
+	data, err := readTrimmedFile(s.filePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if len(data) == 0 {
+		return nil, false, nil
+	}
+
 	var state blockedEventState
-	if err := json.Unmarshal([]byte(content), &state); err != nil {
-		s.events = nil
-		s.nextID = 0
-		return fmt.Errorf("decode blocked-event legacy json: %w", err)
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, false, nil
 	}
 	items := make([]BlockEvent, 0, len(state.Items))
 	var maxID uint64
@@ -319,12 +416,11 @@ func (s *BlockEventStore) loadLegacyJSONLocked(content string) error {
 		}
 		items = append(items, item)
 	}
-	s.events = items
-	s.nextID = maxID
-	if s.maxEntries > 0 && len(s.events) > s.maxEntries {
-		s.events = append([]BlockEvent(nil), s.events[len(s.events)-s.maxEntries:]...)
+	if state.NextID > maxID {
+		maxID = state.NextID
 	}
-	return nil
+	s.nextID = maxID
+	return items, true, nil
 }
 
 func (s *BlockEventStore) appendLocked(event BlockEvent) error {
@@ -353,7 +449,44 @@ func (s *BlockEventStore) appendLocked(event BlockEvent) error {
 	return nil
 }
 
-func (s *BlockEventStore) rewriteAllLocked() error {
+func (s *BlockEventStore) loadPersistentEventsLocked() ([]BlockEvent, error) {
+	if strings.TrimSpace(s.filePath) == "" {
+		return cloneBlockedEvents(s.events), nil
+	}
+
+	if err := s.ensureLoadedLocked(); err != nil {
+		return nil, err
+	}
+
+	events := make([]BlockEvent, 0, 32)
+	var maxID uint64
+	err := scanJSONLFile(s.filePath, func(line []byte) error {
+		var event BlockEvent
+		if err := json.Unmarshal(line, &event); err != nil {
+			return fmt.Errorf("decode blocked-event jsonl: %w", err)
+		}
+		event = sanitizeBlockedEvent(event)
+		if event.ID > maxID {
+			maxID = event.ID
+		}
+		events = append(events, event)
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.nextID = 0
+			return nil, nil
+		}
+		return nil, err
+	}
+	if s.maxEntries > 0 && len(events) > s.maxEntries {
+		events = append([]BlockEvent(nil), events[len(events)-s.maxEntries:]...)
+	}
+	s.nextID = maxID
+	return events, nil
+}
+
+func (s *BlockEventStore) rewriteAllLocked(events []BlockEvent) error {
 	if strings.TrimSpace(s.filePath) == "" {
 		return nil
 	}
@@ -369,7 +502,7 @@ func (s *BlockEventStore) rewriteAllLocked() error {
 		return err
 	}
 	writer := bufio.NewWriter(file)
-	for _, event := range s.events {
+	for _, event := range events {
 		raw, err := json.Marshal(event)
 		if err != nil {
 			_ = file.Close()
@@ -396,6 +529,28 @@ func (s *BlockEventStore) rewriteAllLocked() error {
 		return err
 	}
 	return nil
+}
+
+func (s *BlockEventStore) enforceMaxEntriesLocked() error {
+	if s.maxEntries <= 0 {
+		return nil
+	}
+	if strings.TrimSpace(s.filePath) == "" {
+		if len(s.events) > s.maxEntries {
+			s.events = append([]BlockEvent(nil), s.events[len(s.events)-s.maxEntries:]...)
+		}
+		return nil
+	}
+
+	events, err := s.loadPersistentEventsLocked()
+	if err != nil {
+		return err
+	}
+	if len(events) <= s.maxEntries {
+		return nil
+	}
+	events = append([]BlockEvent(nil), events[len(events)-s.maxEntries:]...)
+	return s.rewriteAllLocked(events)
 }
 
 func sanitizeBlockedEvent(event BlockEvent) BlockEvent {

@@ -80,3 +80,46 @@ func TestAuditLogStorePersistsAndDropsOldestByMaxBytes(t *testing.T) {
 		}
 	}
 }
+
+func TestAuditLogStoreTrimsOversizedPersistentFileDuringConfigure(t *testing.T) {
+	t.Parallel()
+
+	filePath := filepath.Join(t.TempDir(), "risk-control-audit-logs.jsonl")
+	writer := NewAuditLogStore(1 << 20)
+	if err := writer.ConfigurePersistence(filePath, 1<<20); err != nil {
+		t.Fatalf("ConfigurePersistence(writer): %v", err)
+	}
+
+	base := time.Date(2026, 6, 16, 13, 0, 0, 0, time.UTC)
+	for i := 1; i <= 20; i++ {
+		writer.RecordAuditLog(AuditLogEntry{
+			AuditedAt:       base.Add(time.Duration(i) * time.Second),
+			SessionID:       fmtSession(i),
+			Decision:        "allow",
+			UserTextPreview: strings.Repeat("x", 120),
+			RawAuditResponse: `{"flagged":false,"decision":"allow","policy_code":"none","subcategory_code":"none",
+				"confidence":0.1,"authorized_context":"unknown","malicious_intent":false,"evidence":[],"reason":""}`,
+		})
+	}
+
+	info, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("Stat(before): %v", err)
+	}
+	if info.Size() <= 1200 {
+		t.Fatalf("audit log file size before restart = %d, want > 1200", info.Size())
+	}
+
+	reader := NewAuditLogStore(1200)
+	if err := reader.ConfigurePersistence(filePath, 1200); err != nil {
+		t.Fatalf("ConfigurePersistence(reader): %v", err)
+	}
+
+	info, err = os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("Stat(after): %v", err)
+	}
+	if info.Size() > 1200 {
+		t.Fatalf("audit log file size after configure = %d, want <= 1200", info.Size())
+	}
+}

@@ -1,6 +1,7 @@
 package riskcontrol
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -151,7 +152,7 @@ func (t *SessionTracker) evaluateWithBlockedBans(sessionID string, now time.Time
 
 	decision := audit()
 	decision.Audited = true
-	state.lastDecision = decision
+	state.lastDecision = compactDecisionForSessionCache(decision)
 	state.lastAuditAt = now
 	state.retryAfter = time.Time{}
 	if useBlockedBans && decision.Blocked && blockedTTL > 0 && decision.Error == "" {
@@ -223,7 +224,7 @@ func (t *SessionTracker) completeAsyncAudit(sessionID string, now time.Time, ttl
 	state.auditPending = false
 	state.pendingSince = time.Time{}
 	decision.Audited = true
-	state.lastDecision = decision
+	state.lastDecision = compactDecisionForSessionCache(decision)
 
 	if decision.Error != "" || decision.FailureClass != "" {
 		state.lastAuditAt = time.Time{}
@@ -296,6 +297,18 @@ func (t *SessionTracker) loadPersistedBlockedDecision(sessionID string, now time
 		Reason:  entry.Reason,
 	}
 	return state.lastDecision, true
+}
+
+func compactDecisionForSessionCache(decision Decision) Decision {
+	decision.Reason = truncateAuditLogRunes(strings.TrimSpace(decision.Reason), auditLogReasonLimit)
+	decision.Error = truncateAuditLogRunes(strings.TrimSpace(decision.Error), auditLogErrorLimit)
+	decision.PolicyCode = normalizePolicyCode(decision.PolicyCode)
+	decision.SubcategoryCode = normalizeSubcategoryCode(decision.SubcategoryCode)
+	decision.AuthorizedContext = normalizeAuthorizedContext(decision.AuthorizedContext)
+	decision.FailureClass = truncateAuditLogRunes(strings.TrimSpace(decision.FailureClass), auditLogReasonLimit)
+	decision.Evidence = nil
+	decision.RawResponse = ""
+	return decision
 }
 
 func (t *SessionTracker) upsertPersistedBan(sessionID string, blockedUntil time.Time, reason string, now time.Time) error {

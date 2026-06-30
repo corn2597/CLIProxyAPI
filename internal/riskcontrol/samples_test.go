@@ -1,6 +1,7 @@
 package riskcontrol
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -117,6 +118,51 @@ func TestSampleStoreAnnotatesHistoricalConflict(t *testing.T) {
 	var conflict *SampleLabelConflictError
 	if !errors.As(err, &conflict) {
 		t.Fatalf("Upsert on historical conflict err = %v, want SampleLabelConflictError", err)
+	}
+}
+
+func TestSampleStoreConfigurePersistenceDefersLoadUntilAccess(t *testing.T) {
+	t.Parallel()
+
+	samplePath := filepath.Join(t.TempDir(), "samples.jsonl")
+	record := sanitizeSample(SampleRecord{
+		ID:              1,
+		Label:           SampleShouldAllow,
+		Action:          OverrideAllowSession,
+		SampleKey:       "lazy-load-hash",
+		SourceBlockedID: 12,
+		SessionID:       "lazy-load-session",
+		InputHash:       "lazy-load-hash",
+		UserText:        "ops request",
+	})
+	raw, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := os.WriteFile(samplePath, append(raw, '\n'), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	store := NewSampleStore()
+	if err := store.ConfigurePersistence(samplePath); err != nil {
+		t.Fatalf("ConfigurePersistence: %v", err)
+	}
+	if store.loaded {
+		t.Fatal("store.loaded = true, want lazy load")
+	}
+	if store.labelsByKey != nil {
+		t.Fatalf("labelsByKey = %#v, want nil before first access", store.labelsByKey)
+	}
+
+	status, err := store.StatusForBlockEvent(BlockEvent{ID: 12, InputHash: "lazy-load-hash"})
+	if err != nil {
+		t.Fatalf("StatusForBlockEvent: %v", err)
+	}
+	if !store.loaded {
+		t.Fatal("store.loaded = false after first access")
+	}
+	if status.LabelStatus != SampleLabelStatusAllow || status.SampleID != 1 {
+		t.Fatalf("status = %#v, want allow sample 1", status)
 	}
 }
 

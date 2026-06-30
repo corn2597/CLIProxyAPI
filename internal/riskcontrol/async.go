@@ -3,12 +3,10 @@ package riskcontrol
 import (
 	"context"
 	"errors"
-	"net/http"
 	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -17,12 +15,12 @@ var errAsyncAuditQueueFull = errors.New("risk control async audit queue full")
 var defaultAsyncAuditDispatcher = NewAsyncAuditDispatcher()
 
 type asyncCodexAuditTask struct {
-	cfg       *config.Config
-	settings  settings
-	sessionID string
-	req       executor.Request
-	opts      executor.Options
-	input     AuditInput
+	cfg          *config.Config
+	settings     settings
+	sessionID    string
+	meta         auditRecordMeta
+	summaryInput AuditInput
+	inputRef     auditSpoolRef
 }
 
 type AsyncAuditDispatcher struct {
@@ -123,44 +121,53 @@ func (d *AsyncAuditDispatcher) ensureStartedLocked(workers int, queueSize int) {
 	}
 }
 
-func newAsyncCodexAuditTask(cfg *config.Config, settings settings, sessionID string, req executor.Request, opts executor.Options, input AuditInput) asyncCodexAuditTask {
-	return asyncCodexAuditTask{
-		cfg:       cfg,
-		settings:  settings,
-		sessionID: sessionID,
-		req: executor.Request{
-			Model:    req.Model,
-			Payload:  append([]byte(nil), req.Payload...),
-			Format:   req.Format,
-			Metadata: cloneMetadata(req.Metadata),
-		},
-		opts: executor.Options{
-			Stream:          opts.Stream,
-			Alt:             opts.Alt,
-			Headers:         cloneHeader(opts.Headers),
-			OriginalRequest: append([]byte(nil), opts.OriginalRequest...),
-			SourceFormat:    opts.SourceFormat,
-			Metadata:        cloneMetadata(opts.Metadata),
-		},
-		input: AuditInput{
-			Text:         input.Text,
-			Images:       cloneStrings(input.Images),
-			MessageCount: input.MessageCount,
-			Hash:         input.Hash,
-			FocusText:    input.FocusText,
-			FocusStatus:  input.FocusStatus,
-			FocusReason:  input.FocusReason,
-		},
+func newAsyncCodexAuditTask(cfg *config.Config, settings settings, sessionID string, meta auditRecordMeta, input AuditInput) (asyncCodexAuditTask, error) {
+	inputRef, err := defaultAuditSpoolStore.Store(input)
+	if err != nil {
+		return asyncCodexAuditTask{}, err
 	}
+	return asyncCodexAuditTask{
+		cfg:          cfg,
+		settings:     settings,
+		sessionID:    sessionID,
+		meta:         meta,
+		summaryInput: summarizeAuditInput(input),
+		inputRef:     inputRef,
+	}, nil
 }
 
 func processAsyncCodexAuditTask(task asyncCodexAuditTask) {
 	startedAt := time.Now()
-	decision := performAudit(context.Background(), task.cfg, task.settings, task.sessionID, task.req.Model, task.input)
+	input, err := defaultAuditSpoolStore.Load(task.inputRef)
+	if err != nil {
+		defaultAuditSpoolStore.Remove(task.inputRef)
+		decision := Decision{
+			Reason:       "async audit spool unavailable",
+			Error:        err.Error(),
+			FailureClass: "audit_spool_load_failed",
+		}
+		finishedAt := time.Now()
+		duration := finishedAt.Sub(startedAt)
+		recordCodexAuditLog(startedAt, duration, task.settings, task.sessionID, task.meta, task.summaryInput, decision)
+		defaultTracker.completeAsyncAudit(
+			task.sessionID,
+			finishedAt,
+			task.settings.sessionTTL,
+			task.settings.blockedSessionTTL,
+			task.settings.asyncRetryDelay,
+			task.settings.usesBlockedBans(),
+			decision,
+		)
+		log.WithError(err).WithField("session_id", task.sessionID).Warn("risk control: failed to load async audit spool")
+		return
+	}
+	defer defaultAuditSpoolStore.Remove(task.inputRef)
+
+	decision := performAudit(context.Background(), task.cfg, task.settings, task.sessionID, task.meta.UpstreamModel, input)
 	finishedAt := time.Now()
 	duration := finishedAt.Sub(startedAt)
 
-	recordCodexAuditLog(startedAt, duration, task.settings, task.sessionID, task.req, task.opts, task.input, decision)
+	recordCodexAuditLog(startedAt, duration, task.settings, task.sessionID, task.meta, task.summaryInput, decision)
 	defaultTracker.completeAsyncAudit(
 		task.sessionID,
 		finishedAt,
@@ -183,10 +190,10 @@ func processAsyncCodexAuditTask(task asyncCodexAuditTask) {
 	}).Debug("risk control: completed async codex audit")
 
 	if shouldRecordObserveEvent(task.settings, decision) {
-		recordCodexObserveEvent(finishedAt, task.settings, task.sessionID, task.req, task.opts, task.input, decision, DecisionSourceFreshAudit)
+		recordCodexObserveEvent(finishedAt, task.settings, task.sessionID, task.meta, task.summaryInput, decision, DecisionSourceFreshAudit)
 	}
 	if decision.Blocked && shouldRecordBlockedEvent(task.settings, decision) {
-		recordCodexBlockedEvent(finishedAt, task.settings, task.sessionID, task.req, task.opts, task.input, decision, DecisionSourceFreshAudit, riskControlBlockMessage(task.settings, decision))
+		recordCodexBlockedEvent(finishedAt, task.settings, task.sessionID, task.meta, task.summaryInput, decision, DecisionSourceFreshAudit, riskControlBlockMessage(task.settings, decision))
 	}
 }
 
@@ -212,11 +219,4 @@ func cloneMetadata(meta map[string]any) map[string]any {
 		cloned[key] = value
 	}
 	return cloned
-}
-
-func cloneHeader(header http.Header) http.Header {
-	if header == nil {
-		return nil
-	}
-	return header.Clone()
 }

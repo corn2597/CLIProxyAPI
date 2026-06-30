@@ -908,6 +908,10 @@ func (s *Server) configureRiskControlBlockedEventStore(logDir string) {
 	if err := riskcontrol.ConfigureDefaultAuditLogStore(auditLogFilePath); err != nil {
 		log.WithError(err).Warn("risk control: audit-log store persistence configuration failed")
 	}
+	auditSpoolDir := filepath.Join(logDir, "risk-control-audit-spool")
+	if err := riskcontrol.ConfigureDefaultAuditSpoolStore(auditSpoolDir); err != nil {
+		log.WithError(err).Warn("risk control: audit spool persistence configuration failed")
+	}
 	banFilePath := filepath.Join(logDir, "risk-control-session-bans.json")
 	if err := riskcontrol.ConfigureDefaultSessionBanStore(banFilePath); err != nil {
 		log.WithError(err).Warn("risk control: blocked-session persistence configuration failed")

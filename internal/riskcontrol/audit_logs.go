@@ -136,10 +136,16 @@ func (s *AuditLogStore) ConfigurePersistence(filePath string, maxBytes int64) er
 	s.nextID = 0
 	s.currentBytes = 0
 	s.logs = nil
-
+	if strings.TrimSpace(s.filePath) == "" {
+		return nil
+	}
 	if err := s.ensureLoadedLocked(); err != nil {
-		log.WithError(err).Warn("risk control: failed to load audit-log store")
 		return err
+	}
+	if s.currentBytes > s.maxBytes {
+		if err := s.enforceMaxBytesLocked(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -153,19 +159,32 @@ func (s *AuditLogStore) RecordAuditLog(entry AuditLogEntry) AuditLogEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.ensureLoadedLocked(); err != nil {
-		log.WithError(err).Warn("risk control: failed to prepare audit-log store before record")
+	entry = sanitizeAuditLogEntry(entry)
+	if strings.TrimSpace(s.filePath) == "" {
+		s.nextID++
+		entry.ID = s.nextID
+		s.logs = append(s.logs, entry)
+		lineSize := auditLogLineSize(entry)
+		s.currentBytes += lineSize
+		if err := s.enforceMaxBytesLocked(); err != nil {
+			log.WithError(err).Warn("risk control: failed to trim audit-log store")
+		}
+		return cloneAuditLogEntry(entry)
 	}
 
-	entry = sanitizeAuditLogEntry(entry)
-	s.nextID++
-	entry.ID = s.nextID
-	s.logs = append(s.logs, entry)
+	if err := s.ensureLoadedLocked(); err != nil {
+		log.WithError(err).Warn("risk control: failed to prepare audit-log store before record")
+		return cloneAuditLogEntry(entry)
+	}
+
+	entry.ID = s.nextID + 1
 	lineSize := auditLogLineSize(entry)
-	s.currentBytes += lineSize
 	if err := s.appendLocked(entry); err != nil {
 		log.WithError(err).Warn("risk control: failed to append audit-log store")
+		return cloneAuditLogEntry(entry)
 	}
+	s.nextID = entry.ID
+	s.currentBytes += lineSize
 	if err := s.enforceMaxBytesLocked(); err != nil {
 		log.WithError(err).Warn("risk control: failed to trim audit-log store")
 	}
@@ -192,13 +211,22 @@ func (s *AuditLogStore) ListAuditLogs(opts AuditLogListOptions) AuditLogPage {
 	inputHashNeedle := strings.ToLower(strings.TrimSpace(opts.InputHash))
 
 	s.mu.Lock()
-	if err := s.ensureLoadedLocked(); err != nil {
-		log.WithError(err).Warn("risk control: failed to load audit-log store for listing")
+	var (
+		snapshot []AuditLogEntry
+		errLoad  error
+	)
+	if strings.TrimSpace(s.filePath) == "" {
+		snapshot = cloneAuditLogEntries(s.logs)
+		page.CurrentBytes = s.currentBytes
+		page.MaxBytes = s.maxBytes
+	} else {
+		snapshot, page.CurrentBytes, errLoad = s.loadPersistentEntriesLocked()
+		page.MaxBytes = s.maxBytes
 	}
-	snapshot := cloneAuditLogEntries(s.logs)
-	page.CurrentBytes = s.currentBytes
-	page.MaxBytes = s.maxBytes
 	s.mu.Unlock()
+	if errLoad != nil {
+		log.WithError(errLoad).Warn("risk control: failed to load audit-log store for listing")
+	}
 
 	page.Items = make([]AuditLogEntry, 0, minInt(limit, len(snapshot)))
 	for i := len(snapshot) - 1; i >= 0; i-- {
@@ -239,54 +267,39 @@ func (s *AuditLogStore) ensureLoadedLocked() error {
 	if s.loaded {
 		return nil
 	}
-	s.loaded = true
+	s.nextID = 0
+	s.currentBytes = 0
 
 	if strings.TrimSpace(s.filePath) == "" {
+		s.loaded = true
 		return nil
 	}
 
-	data, err := os.ReadFile(s.filePath)
+	info, err := os.Stat(s.filePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			s.loaded = true
 			return nil
 		}
 		return err
 	}
-	content := strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
-	if content == "" {
+	s.currentBytes = info.Size()
+	line, err := readLastNonEmptyLine(s.filePath)
+	if err != nil {
+		return fmt.Errorf("read audit-log tail: %w", err)
+	}
+	if len(line) == 0 {
+		s.loaded = true
 		return nil
 	}
-
-	scanner := bufio.NewScanner(strings.NewReader(content))
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 4<<20)
-	entries := make([]AuditLogEntry, 0, 128)
-	var maxID uint64
-	var currentBytes int64
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var entry AuditLogEntry
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			return fmt.Errorf("decode audit-log jsonl: %w", err)
-		}
-		entry = sanitizeAuditLogEntry(entry)
-		if entry.ID > maxID {
-			maxID = entry.ID
-		}
-		entries = append(entries, entry)
-		currentBytes += auditLogLineSize(entry)
+	var entry AuditLogEntry
+	if err := json.Unmarshal(line, &entry); err != nil {
+		return fmt.Errorf("decode audit-log tail: %w", err)
 	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan audit-log jsonl: %w", err)
-	}
-
-	s.logs = entries
-	s.nextID = maxID
-	s.currentBytes = currentBytes
-	return s.enforceMaxBytesLocked()
+	entry = sanitizeAuditLogEntry(entry)
+	s.nextID = entry.ID
+	s.loaded = true
+	return nil
 }
 
 func (s *AuditLogStore) appendLocked(entry AuditLogEntry) error {
@@ -320,10 +333,39 @@ func (s *AuditLogStore) enforceMaxBytesLocked() error {
 		return nil
 	}
 
+	if strings.TrimSpace(s.filePath) == "" {
+		var total int64
+		start := len(s.logs)
+		for i := len(s.logs) - 1; i >= 0; i-- {
+			lineSize := auditLogLineSize(s.logs[i])
+			if total > 0 && total+lineSize > s.maxBytes {
+				break
+			}
+			total += lineSize
+			start = i
+		}
+		if start < 0 {
+			start = 0
+		}
+		if start > 0 {
+			s.logs = append([]AuditLogEntry(nil), s.logs[start:]...)
+			s.currentBytes = total
+		}
+		return nil
+	}
+
+	entries, currentBytes, err := s.loadPersistentEntriesLocked()
+	if err != nil {
+		return err
+	}
+	if currentBytes <= s.maxBytes {
+		return nil
+	}
+
 	var total int64
-	start := len(s.logs)
-	for i := len(s.logs) - 1; i >= 0; i-- {
-		lineSize := auditLogLineSize(s.logs[i])
+	start := len(entries)
+	for i := len(entries) - 1; i >= 0; i-- {
+		lineSize := auditLogLineSize(entries[i])
 		if total > 0 && total+lineSize > s.maxBytes {
 			break
 		}
@@ -334,13 +376,50 @@ func (s *AuditLogStore) enforceMaxBytesLocked() error {
 		start = 0
 	}
 	if start > 0 {
-		s.logs = append([]AuditLogEntry(nil), s.logs[start:]...)
-		s.currentBytes = total
+		entries = append([]AuditLogEntry(nil), entries[start:]...)
 	}
-	return s.rewriteAllLocked()
+	s.currentBytes = total
+	return s.rewriteAllLocked(entries)
 }
 
-func (s *AuditLogStore) rewriteAllLocked() error {
+func (s *AuditLogStore) loadPersistentEntriesLocked() ([]AuditLogEntry, int64, error) {
+	if strings.TrimSpace(s.filePath) == "" {
+		return cloneAuditLogEntries(s.logs), s.currentBytes, nil
+	}
+
+	entries := make([]AuditLogEntry, 0, 128)
+	var (
+		maxID        uint64
+		currentBytes int64
+	)
+	err := scanJSONLFile(s.filePath, func(line []byte) error {
+		var entry AuditLogEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			return fmt.Errorf("decode audit-log jsonl: %w", err)
+		}
+		entry = sanitizeAuditLogEntry(entry)
+		if entry.ID > maxID {
+			maxID = entry.ID
+		}
+		entries = append(entries, entry)
+		currentBytes += auditLogLineSize(entry)
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.nextID = 0
+			s.currentBytes = 0
+			return nil, 0, nil
+		}
+		return nil, 0, err
+	}
+	s.loaded = true
+	s.nextID = maxID
+	s.currentBytes = currentBytes
+	return entries, currentBytes, nil
+}
+
+func (s *AuditLogStore) rewriteAllLocked(entries []AuditLogEntry) error {
 	if strings.TrimSpace(s.filePath) == "" {
 		return nil
 	}
@@ -356,7 +435,7 @@ func (s *AuditLogStore) rewriteAllLocked() error {
 		return err
 	}
 	writer := bufio.NewWriter(file)
-	for _, entry := range s.logs {
+	for _, entry := range entries {
 		raw, err := json.Marshal(entry)
 		if err != nil {
 			_ = file.Close()
